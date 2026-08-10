@@ -1,0 +1,45 @@
+{
+  "manifest_version": 2,
+  "id": "feyumy.affection-system",
+  "version": "1.1.0",
+  "name": "好感度系统",
+  "description": "为 MaiBot 角色扮演提供好感度追踪系统。记录不同用户的好感度（-20~100），分为不喜/正常/熟悉/亲近/亲密/思慕六个等级，根据角色性格和用户行为动态调整，并提供对应的回应风格提示。数据持久化存储，支持 WebUI 可视化配置。",
+  "author": {
+    "name": "Feyumy",
+    "url": "https://github.com/feiyunming"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/feiyunming/maibot-affection-system",
+    "homepage": "https://github.com/feiyunming/maibot-affection-system",
+    "documentation": "https://github.com/feiyunming/maibot-affection-system/blob/main/README.md",
+    "issues": "https://github.com/feiyunming/maibot-affection-system/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "plugin_type": "data",
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "tomlkit",
+      "version_spec": ">=0.13.3"
+    }
+  ],
+  "capabilities": [
+    "send.text",
+    "chat.get_all_streams",
+    "person.get_id_by_name"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

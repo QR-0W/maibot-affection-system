@@ -1,0 +1,23 @@
+# 运行时配置由 Runner 根据 config_model 生成，不入库
+/config.toml
+
+# 本地配置备份
+/config_back/
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 日志、测试产物与临时文件
+*.log
+.pytest_cache/
+dist/
+build/
