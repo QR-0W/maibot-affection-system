@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "feyumy.affection-system",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "name": "好感度系统",
   "description": "为 MaiBot 角色扮演提供好感度追踪系统。记录不同用户的好感度（-20~100），分为不喜/正常/熟悉/亲近/亲密/思慕六个等级，根据角色性格和用户行为动态调整，并提供对应的回应风格提示。数据持久化存储，支持 WebUI 可视化配置。",
   "author": {
@@ -34,6 +34,7 @@
   "capabilities": [
     "send.text",
     "chat.get_all_streams",
+    "message.get_recent",
     "person.get_id_by_name"
   ],
   "i18n": {

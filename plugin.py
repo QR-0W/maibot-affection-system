@@ -29,7 +29,9 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -122,9 +124,13 @@ class AffectionPlugin(MaiBotPlugin):
         # 同步配置表时的去重记录：避免重复写入 config.toml
         self._last_config_sync_key: str = ""
         # 会话 → 最近发言用户映射缓存：{ session_id: user_id }
-        # 群聊流的 user_id 为 None，无法从 stream 直接反查；通过在 Tool 调用时
-        # 记录「会话 ↔ 权威 QQ 号」映射，供注入 Hook 使用。
+        # 群聊流的 user_id 为 None，无法从 stream 直接反查；该缓存由
+        # before_request 每轮解析成功时刷新，代表「当前轮发言人」。
         self._session_user_map: dict[str, str] = {}
+        # 接收索引：{ session_id: deque[(message_id, user_id)] }
+        # 在 chat.receive.after_process 时建立（消息到达即记录，不依赖入库时机），
+        # 供 before_request 按 prompt 中的 msg_id 精确反查当前发言人。
+        self._session_message_index: dict[str, deque[tuple[str, str]]] = {}
 
     # ════════════════════════════════════════════════════════════════
     # 生命周期方法
@@ -539,6 +545,7 @@ class AffectionPlugin(MaiBotPlugin):
     async def _resolve_user_id(
         self,
         requested_user_id: str,
+        stream_id: str = "",
         **kwargs: Any,
     ) -> str:
         """将互动对象统一解析为稳定、唯一的 QQ 号标识。
@@ -550,10 +557,14 @@ class AffectionPlugin(MaiBotPlugin):
             1. 运行时注入的 user_id（消息元数据中的真实平台 ID，即 QQ 号）
             2. 显式传入且为纯数字的 user_id（视为 QQ 号）
             3. 尝试通过 person 能力把昵称解析为人物 ID
-            4. 兜底：原样返回
+            4. 当前轮发言人（before_request 已按 prompt 锚定刷新）→ 接收索引
+               最近发言人 → 消息库最近消息（群聊关键：Tool 调用上下文在群聊
+               中不携带 user_id）
+            5. 兜底：原样返回
 
         Args:
             requested_user_id: LLM 传入的 user_id 参数（可能是昵称或 QQ 号）
+            stream_id: 当前聊天流 ID（由调用方传入，用于群聊反查）
             **kwargs: 运行时注入的上下文参数（含权威 user_id 等）
 
         Returns:
@@ -588,7 +599,49 @@ class AffectionPlugin(MaiBotPlugin):
             except Exception as e:
                 self.ctx.logger.debug("昵称解析失败 (%s): %s", requested, e)
 
-        # 4. 兜底：返回注入值或原参数
+        # 4. 群聊兜底：使用当前会话已解析的发言人。
+        #    群聊会话按群维度建立（session_id 只含群号），Tool 调用上下文里的
+        #    chat_stream.user_id 恒为空。优先使用 before_request 每轮解析并
+        #    刷新的「当前轮发言人」缓存，其次为接收索引中的最近发言人，
+        #    最后退回消息库最近消息反查。
+        resolved_stream_id = str(stream_id or "").strip() or str(
+            kwargs.get("stream_id") or kwargs.get("chat_id") or ""
+        ).strip()
+        if resolved_stream_id:
+            # 4.1 当前轮发言人缓存（before_request 已按 prompt 锚定刷新）
+            cached_user = self._session_user_map.get(resolved_stream_id, "")
+            if cached_user:
+                self.ctx.logger.debug(
+                    "使用当前轮发言人缓存: %s -> %s", resolved_stream_id, cached_user
+                )
+                return cached_user
+
+            # 4.2 接收索引最近发言人（近似）
+            indexed_user = self._lookup_latest_session_speaker(resolved_stream_id)
+            if indexed_user:
+                self.ctx.logger.debug(
+                    "使用接收索引最近发言人: %s -> %s", resolved_stream_id, indexed_user
+                )
+                return indexed_user
+
+            # 4.3 消息库最近消息反查（兜底）
+            try:
+                session_user = await self._resolve_user_id_from_recent_messages(
+                    resolved_stream_id
+                )
+                if session_user:
+                    self.ctx.logger.debug(
+                        "已通过会话最近消息解析用户标识: %s -> %s",
+                        resolved_stream_id,
+                        session_user,
+                    )
+                    return session_user
+            except Exception as e:
+                self.ctx.logger.debug(
+                    "会话最近消息解析失败 (%s): %s", resolved_stream_id, e
+                )
+
+        # 5. 兜底：返回注入值或原参数
         return injected or requested
 
     def _check_cool_down(self, user_id: str) -> bool:
@@ -895,7 +948,7 @@ class AffectionPlugin(MaiBotPlugin):
             好感度查询结果
         """
         # 统一识别：优先使用运行时注入的真实 QQ 号，避免群聊昵称/私聊 QQ 号歧义
-        resolved_user_id = await self._resolve_user_id(user_id, **kwargs)
+        resolved_user_id = await self._resolve_user_id(user_id, stream_id, **kwargs)
         if not resolved_user_id:
             return {"success": False, "error": "无法确定互动对象的用户标识"}
 
@@ -1030,7 +1083,7 @@ class AffectionPlugin(MaiBotPlugin):
             调整结果
         """
         # 统一识别：优先使用运行时注入的真实 QQ 号，避免群聊昵称/私聊 QQ 号歧义
-        resolved_user_id = await self._resolve_user_id(user_id, **kwargs)
+        resolved_user_id = await self._resolve_user_id(user_id, stream_id, **kwargs)
         if not resolved_user_id:
             return {"success": False, "error": "无法确定互动对象的用户标识"}
 
@@ -1162,6 +1215,157 @@ class AffectionPlugin(MaiBotPlugin):
         )
 
         return True, message, 1
+
+    # ════════════════════════════════════════════════════════════════
+    # Hook: 接收时建立「会话 ↔ 消息 ↔ 发送者」索引
+    # ════════════════════════════════════════════════════════════════
+    # 群聊中会话按群维度建立，会话本身不携带发言人信息；唯一可靠的标识在
+    # 每条消息的 message_info.user_info 中。本 Hook 在消息完成预处理后立即
+    # 记录「会话 → (message_id, user_id)」映射（与入库、请求调度无关），
+    # 之后 before_request 通过 prompt 中携带的 msg_id 精确反查当前发言人，
+    # 不受「他人消息先于本轮请求写入消息库」的竞态影响。
+
+    _PROMPT_MSG_ID_PATTERN = re.compile(r'msg_id="([^"]*)"')
+
+    @HookHandler(
+        "chat.receive.after_process",
+        name="affection_index_speaker",
+        description="在入站消息完成预处理后，记录会话内消息 ID 到发送者 QQ 号的映射，供好感度注入精确解析当前发言人",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=2000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def index_message_speaker(
+        self,
+        message: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """在消息接收阶段建立「会话 → 消息 ID → 发送者」索引。
+
+        Args:
+            message: 已完成预处理、序列化的入站 SessionMessage 字典
+            **kwargs: 其他 Hook 参数
+
+        Returns:
+            Hook 分发结果：继续执行
+        """
+        del kwargs
+        if not isinstance(message, dict):
+            return {"action": "continue"}
+
+        session_id = str(message.get("session_id") or "").strip()
+        message_id = str(message.get("message_id") or "").strip()
+        user_id = ""
+        message_info = message.get("message_info")
+        if isinstance(message_info, dict):
+            user_info = message_info.get("user_info")
+            if isinstance(user_info, dict):
+                user_id = str(user_info.get("user_id") or "").strip()
+        if not (session_id and message_id and user_id):
+            return {"action": "continue"}
+
+        # 保序去重：同一 message_id 重新接收时移到队尾
+        dq = self._session_message_index.setdefault(session_id, deque(maxlen=100))
+        for index, (existing_id, _existing_user) in enumerate(dq):
+            if existing_id == message_id:
+                del dq[index]
+                break
+        dq.append((message_id, user_id))
+        return {"action": "continue"}
+
+    @staticmethod
+    def _extract_prompt_message_id(content: str) -> str:
+        """从 planner prompt 消息内容中提取消息前缀携带的 msg_id。
+
+        Maisaka 会把用户消息渲染为 `<message msg_id="xxx" time="..." user="...">\n内容`
+        形式，序列化后的 content 保留完整前缀，因此可以从中解析出消息 ID，
+        用于在接收索引中精确反查发送者。
+
+        Args:
+            content: prompt 中单条消息的 content 文本
+
+        Returns:
+            消息 ID；未找到时返回空字符串
+        """
+        match = AffectionPlugin._PROMPT_MSG_ID_PATTERN.search(content or "")
+        return match.group(1).strip() if match else ""
+
+    def _lookup_message_speaker(self, session_id: str, message_id: str) -> str:
+        """按消息 ID 从接收索引反查发送者 QQ 号。
+
+        Args:
+            session_id: 会话 ID
+            message_id: 目标消息 ID
+
+        Returns:
+            发送者用户标识；未命中时返回空字符串
+        """
+        dq = self._session_message_index.get(session_id)
+        if not dq:
+            return ""
+        for indexed_id, indexed_user in dq:
+            if indexed_id == message_id:
+                return indexed_user
+        return ""
+
+    def _lookup_latest_session_speaker(self, session_id: str) -> str:
+        """返回会话接收索引中最近一条消息的发送者（近似方案）。
+
+        当无法从 prompt 精确锚定（例如 replyer 阶段无消息列表）时，
+        使用「最近发言者」作为近似。
+
+        Args:
+            session_id: 会话 ID
+
+        Returns:
+            最近发言者用户标识；索引为空时返回空字符串
+        """
+        dq = self._session_message_index.get(session_id)
+        if not dq:
+            return ""
+        return dq[-1][1]
+
+    def _resolve_user_from_prompt_messages(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """从 planner prompt 的最后一条用户消息精确锚定发言人。
+
+        prompt 是按接收顺序构建的快照，晚于本轮构建到达的消息不会进入
+        prompt；因此「最后一条用户消息」就是模型本轮实际看到并要回应的
+        消息。解析其 msg_id 后在接收索引中反查发送者，即可规避
+        「他人消息先入库」导致的错配。
+
+        Args:
+            session_id: 会话 ID
+            messages: before_request 收到的序列化消息列表
+
+        Returns:
+            锚定到的用户标识；无法锚定时返回空字符串
+        """
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            # 工具结果也会以 user 角色出现（带 tool_call_id），跳过
+            if msg.get("tool_call_id"):
+                continue
+            content = str(msg.get("content") or "")
+            message_id = self._extract_prompt_message_id(content)
+            if not message_id:
+                # 非真实会话消息（如参考消息、引导回复），继续向前找
+                continue
+            user_id = self._lookup_message_speaker(session_id, message_id)
+            if user_id:
+                return user_id
+            # 最后一条真实用户消息的 msg_id 在索引中未命中（如插件热重载后
+            # 索引尚未重建），不再向前匹配更早的消息，交由后续兜底逻辑处理，
+            # 避免错配到历史发言人。
+            return ""
+        return ""
 
     # ════════════════════════════════════════════════════════════════
     # Hook: 注入好感度提示（参考 ns_auto-planning_schedule 的调用方式）
@@ -1321,9 +1525,9 @@ class AffectionPlugin(MaiBotPlugin):
         if not isinstance(messages, list) or not messages:
             return {"action": "continue"}
 
-        # 通过 session_id 反查发言者 QQ 号；解析失败时退化为通用好感度提示，
-        # 确保注入始终发生。
-        user_id = await self._resolve_user_id_from_session(session_id)
+        # 通过 session_id 反查发言者 QQ 号；优先用 prompt 中的 msg_id 精确锚定，
+        # 解析失败时退化为通用好感度提示，确保注入始终发生。
+        user_id = await self._resolve_user_id_from_session(session_id, messages)
         if user_id:
             hint_text = self._build_affection_hint(user_id)
         else:
@@ -1360,14 +1564,25 @@ class AffectionPlugin(MaiBotPlugin):
         )
         return {"action": "continue", "modified_kwargs": {"messages": modified_messages}}
 
-    async def _resolve_user_id_from_session(self, session_id: str) -> str:
+    async def _resolve_user_id_from_session(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> str:
         """根据会话 ID 反查发言者的权威用户标识（QQ 号）。
 
-        优先使用运行时 Tool 调用时缓存的「会话↔用户」映射；其次尝试从
-        聊天流列表反查（仅对私聊有效，群聊流 user_id 为 None）。
+        解析优先级：
+            1. prompt 锚定：从 messages 中最后一条用户消息的 msg_id 精确反查
+               （接收索引在 chat.receive.after_process 时建立，与入库时机无关）
+            2. 接收索引中该会话最近一条消息的发送者（无 prompt 时的近似）
+            3. 运行时 Tool 调用时缓存的「会话↔用户」映射
+            4. 从消息库最近消息反查（兜底）
+            5. 从聊天流列表反查（仅对私聊有效，群聊流 user_id 恒为空）
 
         Args:
             session_id: 会话 ID
+            messages: 可选；planner before_request 收到的序列化消息列表，
+                用于 msg_id 精确锚定
 
         Returns:
             用户平台 ID；无法解析时返回空字符串
@@ -1376,12 +1591,33 @@ class AffectionPlugin(MaiBotPlugin):
         if not session_id:
             return ""
 
-        # 1. 命中缓存（由 Tool 调用时记录，最可靠）
+        # 1. prompt 锚定（最精确）：prompt 是接收顺序的快照，晚于本轮构建
+        #    到达的消息不会进入 prompt；最后一条用户消息的 msg_id 即本轮
+        #    要回应的消息，反查接收索引即可拿到其发送者。
+        if isinstance(messages, list) and messages:
+            anchored_user_id = self._resolve_user_from_prompt_messages(session_id, messages)
+            if anchored_user_id:
+                self._session_user_map[session_id] = anchored_user_id
+                return anchored_user_id
+
+        # 2. 接收索引最近发言人（近似，replyer 等无 prompt 场景）
+        latest_user_id = self._lookup_latest_session_speaker(session_id)
+        if latest_user_id:
+            self._session_user_map[session_id] = latest_user_id
+            return latest_user_id
+
+        # 3. 命中缓存（由 Tool 调用或之前轮次解析记录）
         cached = self._session_user_map.get(session_id, "")
         if cached:
             return cached
 
-        # 2. 从聊天流列表反查（私聊场景有效）
+        # 4. 从消息库最近消息反查（兜底：插件热重载后索引尚未建立时）
+        recent_user_id = await self._resolve_user_id_from_recent_messages(session_id)
+        if recent_user_id:
+            self._session_user_map[session_id] = recent_user_id
+            return recent_user_id
+
+        # 5. 从聊天流列表反查（私聊场景有效）
         try:
             streams = await self.ctx.chat.get_all_streams(platform="all_platforms")
         except Exception as e:
@@ -1397,6 +1633,53 @@ class AffectionPlugin(MaiBotPlugin):
                 uid = str(stream.get("user_id") or "").strip()
                 if uid:
                     self._session_user_map[session_id] = uid
+                return uid
+        return ""
+
+    async def _resolve_user_id_from_recent_messages(self, session_id: str) -> str:
+        """从会话最近消息反查当前发言人用户标识（QQ 号）。
+
+        群聊中会话按群维度建立（session_id 仅由平台+群号计算），发言人的
+        用户标识只能从具体消息的 message_info.user_info 获取。触发本次请求的
+        用户消息在进入 chat loop 前已写入消息库（见 heartflow_message_processor
+        的 store_message_to_db），因此「最近一条用户消息」的发送者就是当前
+        互动对象；私聊场景同样成立。
+
+        Args:
+            session_id: 会话 ID
+
+        Returns:
+            最近发言人平台 ID；无法解析时返回空字符串
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return ""
+        try:
+            raw = await self.ctx.call_capability(
+                "message.get_recent",
+                chat_id=session_id,
+                limit=8,
+                filter_mai=True,
+            )
+        except Exception as e:
+            self.ctx.logger.debug("查询会话 %s 最近消息失败: %s", session_id, e)
+            return ""
+        if isinstance(raw, dict):
+            raw = raw.get("messages") or []
+        if not isinstance(raw, list) or not raw:
+            return ""
+        # 消息按时间正序返回，倒序遍历取最近一条带发送者的用户消息
+        for msg in reversed(raw):
+            if not isinstance(msg, dict):
+                continue
+            message_info = msg.get("message_info")
+            if not isinstance(message_info, dict):
+                continue
+            user_info = message_info.get("user_info")
+            if not isinstance(user_info, dict):
+                continue
+            uid = str(user_info.get("user_id") or "").strip()
+            if uid:
                 return uid
         return ""
 

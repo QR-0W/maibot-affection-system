@@ -89,7 +89,8 @@
 插件仅在需要时向 Host 申请以下能力：
 
 - `send.text`：发送查询结果等文本消息。
-- `chat.get_all_streams`：根据会话反查发言者身份（私聊场景）。
+- `chat.get_all_streams`：根据会话反查发言者身份（私聊场景兜底）。
+- `message.get_recent`：反查会话最近一条用户消息的发送者，作为群聊/私聊下「当前发言人」的权威识别来源。
 - `person.get_id_by_name`：把昵称解析为稳定的用户 ID，避免同一人被拆成两条记录。
 
 插件运行在独立 Runner 子进程中，不导入 `src.*`，所有能力均通过 `self.ctx` 代理调用。
