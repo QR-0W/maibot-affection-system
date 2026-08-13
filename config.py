@@ -22,7 +22,7 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用插件"},
     )
     config_version: str = Field(
-        default="1.0.0",
+        default="1.1.0",
         description="配置版本号",
         json_schema_extra={"label": "配置版本"},
     )
@@ -140,6 +140,16 @@ class AffectionRuleSection(PluginConfigBase):
     __ui_icon__ = "sliders"
     __ui_order__ = 2
 
+    initial_affection: float = Field(
+        default=10.0,
+        description="新用户首次互动时的初始好感度（默认 10，对应「正常」等级起点）",
+        json_schema_extra={
+            "label": "初始好感度",
+            "min": -20,
+            "max": 100,
+            "step": 1,
+        },
+    )
     positive_interaction_min: float = Field(
         default=0.5,
         description="正面互动（赞美、关心、帮助等）的最低好感度增加值",
@@ -243,8 +253,8 @@ class ManagedUserEntry(PluginConfigBase):
         json_schema_extra={"label": "用户 ID", "placeholder": "例如 123456789"},
     )
     affection: float = Field(
-        default=0.0,
-        description="好感度数值，范围 -20 ~ 100",
+        default=10.0,
+        description="好感度数值，范围 -20 ~ 100（默认 10，对应新用户的初始好感度）",
         json_schema_extra={"label": "好感度", "min": -20, "max": 100, "step": 1},
     )
     locked: bool = Field(

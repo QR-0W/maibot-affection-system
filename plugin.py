@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -44,7 +45,9 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo
 from .config import AffectionConfig
 
 # ════════════════════════════════════════════════════════════════
-# 好感度等级定义 (最小值, 最大值, 等级名称, 等级描述)
+# 好感度等级定义 (下界含, 上界不含, 等级名称, 等级描述)
+# 区间为左闭右开 [min, max)：边界值归属上一个等级，避免 0/10/20 等
+# 边界值被同时匹配两个等级。仅最后一个等级（思慕）右端含 100。
 # ════════════════════════════════════════════════════════════════
 
 AFFECTION_LEVELS: list[tuple[int, int, str, str]] = [
@@ -80,8 +83,11 @@ def _get_affection_level_info(affection_value: float) -> dict[str, Any]:
         包含等级名称、描述、范围的字典
     """
     clamped = max(-20.0, min(100.0, affection_value))
-    for min_val, max_val, name, description in AFFECTION_LEVELS:
-        if min_val <= clamped <= max_val:
+    last_index = len(AFFECTION_LEVELS) - 1
+    for index, (min_val, max_val, name, description) in enumerate(AFFECTION_LEVELS):
+        # 左闭右开 [min, max)；最后一个区间右端含 100
+        in_range = min_val <= clamped < max_val if index < last_index else min_val <= clamped <= max_val
+        if in_range:
             # 计算在该等级内的进度百分比
             progress = (clamped - min_val) / (max_val - min_val) if max_val > min_val else 0
             return {
@@ -530,8 +536,15 @@ class AffectionPlugin(MaiBotPlugin):
             用户好感度记录字典
         """
         if user_id not in self._affection_data:
+            initial = 10.0
+            if self.config is not None:
+                try:
+                    initial = float(self.config.affection_rule.initial_affection or 10.0)
+                except (AttributeError, TypeError, ValueError):
+                    initial = 10.0
+            initial = max(-20.0, min(100.0, initial))
             self._affection_data[user_id] = {
-                "affection": 0.0,
+                "affection": initial,
                 "history": [],
                 "last_updated": datetime.now().isoformat(),
                 "daily_count": 0,
@@ -1019,16 +1032,21 @@ class AffectionPlugin(MaiBotPlugin):
         "adjust_affection",
         description=(
             "根据用户与角色的互动情况，调整该用户的好感度值。"
-            "在每一次有意义的互动后（正面的赞美帮助、负面的冒犯争吵、中性的普通聊天、"
-            "特殊的送礼表白等），应当调用此工具来记录并更新好感度。"
-            "好感度范围从 -20（极度反感）到 100（思慕倾心）。"
-            "调用时机："
-            "- 用户说了赞美/关心/感谢/安慰的话 → interaction_type='positive'"
-            "- 用户说了冒犯/辱骂/嘲讽/冷漠的话 → interaction_type='negative'"
-            "- 用户进行了普通日常聊天 → interaction_type='neutral'"
-            "- 用户送了礼物/表白（比较亲近的时候）/做了特别的事 → interaction_type='special'"
-            "注意：好感度并非每次说话都应调整，应根据角色性格和互动质量判断是否需要调整。"
-            "琐碎的闲聊不需要调用此工具。"
+            "在每一次有意义的互动后（赞美、鼓励、安慰、道歉、感谢、帮助、送礼、表白等"
+            "正面互动；冒犯、嘲讽、争吵、无视、爽约、泼冷水等负面互动），应当调用此工具"
+            "记录并更新好感度。好感度范围从 -20（极度反感）到 100（思慕倾心），初始为 10。"
+            "调用时机与互动类型："
+            "- positive（正面互动）：赞美、鼓励、感谢、安慰、道歉求和、帮助、主动关心、"
+            "分享秘密、陪伴等 → 好感度增加"
+            "- negative（负面互动）：辱骂、嘲讽、争吵、无视、泼冷水、爽约、揭短、"
+            "背叛信任、造谣等 → 好感度减少"
+            "- neutral（中性互动）：普通日常闲聊、问好、讨论话题等 → 好感度基本不变或微量增加"
+            "- special（特殊互动）：送礼、表白、重大帮助、难忘惊喜、特别纪念日等 → 好感度大幅增加"
+            "调整幅度：可填写 change_value 参数，按互动的重要程度给出具体变化值"
+            "（如：轻微调侃 -1、诚心道歉 +2、救命之恩 +8）；不填写时插件会按互动类型"
+            "在配置范围内自动取值。变化值会受角色性格倍率和系统安全范围限制，"
+            "请勿填写极端数值。"
+            "注意：好感度并非每次说话都应调整，琐碎的闲聊不需要调用此工具，避免频繁变更。"
             "注意：通常无需填写 user_id，运行时会自动注入当前互动对象的 QQ 号；"
             "如需调整指定对象请填写其 QQ 号（不要填昵称）。"
         ),
@@ -1051,8 +1069,17 @@ class AffectionPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="description",
                 param_type=ToolParamType.STRING,
-                description="简短描述本次互动的内容（如「用户赞美了角色的新衣服」）",
+                description="简短描述本次互动的内容（如「用户赞美了角色的新衣服」「用户送了生日礼物」）",
                 required=True,
+            ),
+            ToolParameterInfo(
+                name="change_value",
+                param_type=ToolParamType.FLOAT,
+                description=(
+                    "可选的精确变化值（可正可负，如：轻微调侃 -1、诚心道歉 +2、"
+                    "救命之恩 +8）。按互动的重要程度填写；不填时插件按互动类型自动取值。"
+                ),
+                required=False,
             ),
             ToolParameterInfo(
                 name="stream_id",
@@ -1067,6 +1094,7 @@ class AffectionPlugin(MaiBotPlugin):
         user_id: str = "",
         interaction_type: str = "",
         description: str = "",
+        change_value: float | None = None,
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
@@ -1076,6 +1104,7 @@ class AffectionPlugin(MaiBotPlugin):
             user_id: 用户 QQ 号或昵称（可留空，运行时注入当前对象；会统一解析为 QQ 号）
             interaction_type: 互动类型
             description: 互动描述
+            change_value: 可选的精确变化值（可正可负）；不填时按互动类型自动取值
             stream_id: 聊天流 ID（由运行时注入）
             **kwargs: 额外参数
 
@@ -1118,7 +1147,26 @@ class AffectionPlugin(MaiBotPlugin):
 
         # 根据互动类型和配置计算好感度变化值
         cfg = self.config.affection_rule
-        if interaction_type == "positive":
+        requested_change = None
+        if change_value is not None:
+            try:
+                requested_change = float(change_value)
+            except (TypeError, ValueError):
+                requested_change = None
+            if requested_change is not None and not math.isfinite(requested_change):
+                requested_change = None
+
+        if requested_change is not None:
+            # LLM 按互动重要程度给出的精确变化值，按类型约束在安全范围内
+            if interaction_type == "negative":
+                change_value = max(-10.0, min(requested_change, -0.1))
+            elif interaction_type == "neutral":
+                change_value = max(0.0, min(requested_change, 1.0))
+            elif interaction_type == "special":
+                change_value = max(1.0, min(requested_change, 20.0))
+            else:
+                change_value = max(0.1, min(requested_change, 10.0))
+        elif interaction_type == "positive":
             min_val = cfg.positive_interaction_min
             max_val = cfg.positive_interaction_max
             change_value = random.uniform(min_val, max_val)
@@ -1729,8 +1777,9 @@ class AffectionPlugin(MaiBotPlugin):
             and self.config.call_behavior.encourage_tool_calls
         ):
             lines.append(
-                "如果本次互动有明显的正面或负面情绪（如赞美、帮助、冒犯、争吵、"
-                "感谢、关心等），在回应之后请调用 adjust_affection 工具更新好感度。"
+                "如果本次互动有明显的正面或负面情绪（如赞美、安慰、道歉、感谢、帮助、"
+                "送礼、表白、嘲讽、争吵、无视等），在回应之后请调用 adjust_affection "
+                "工具更新好感度。"
             )
         return "\n".join(lines)
 
@@ -1754,8 +1803,9 @@ class AffectionPlugin(MaiBotPlugin):
         ]
         if not for_replyer and self.config and self.config.call_behavior.encourage_tool_calls:
             lines.append(
-                "如果本次互动有明显的正面或负面情绪（如赞美、帮助、冒犯、争吵、"
-                "感谢、关心等），在回应之后请调用 adjust_affection 工具更新好感度。"
+                "如果本次互动有明显的正面或负面情绪（如赞美、安慰、道歉、感谢、帮助、"
+                "送礼、表白、嘲讽、争吵、无视等），在回应之后请调用 adjust_affection "
+                "工具更新好感度。"
             )
         return "\n".join(lines)
 

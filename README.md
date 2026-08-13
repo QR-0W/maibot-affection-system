@@ -52,12 +52,15 @@
 
 | 字段 | 说明 | 默认值 |
 | --- | --- | --- |
+| `initial_affection` | 新用户首次互动时的初始好感度 | `10.0` |
 | `positive_interaction_min/max` | 正面互动（赞美、关心等）增加范围 | `0.5 ~ 3.0` |
 | `negative_interaction_min/max` | 负面互动（冒犯、争吵等）减少范围 | `-3.0 ~ -0.5` |
 | `neutral_interaction_value` | 中性互动（普通聊天）增值 | `0.1` |
 | `special_interaction_value` | 特殊互动（送礼、表白等）增值 | `5.0` |
 | `cool_down_seconds` | 同一位用户两次变更的最小间隔（秒） | `60` |
 | `daily_limit` | 每位用户每天最多变更次数 | `20` |
+
+> 提示：`adjust_affection` 工具支持可选参数 `change_value`，LLM 可按互动的重要程度给出精确变化值（如轻微调侃 `-1`、诚心道歉 `+2`、重大帮助 `+8`）；不填写时按上表各类型的默认范围自动取值。
 
 ### `[response]` 回应风格
 
