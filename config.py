@@ -58,12 +58,69 @@ class CallBehaviorSection(PluginConfigBase):
         },
     )
     encourage_tool_calls: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "是否在注入的好感度提示末尾附上「可调用 adjust_affection 工具」的提醒，"
-            "引导 LLM 在互动后主动更新好感度，提高工具调用频率。"
+            "是否在注入的好感度提示末尾附上「可调用 adjust_affection 工具」的提醒。"
+            "好感度工具已直接暴露给规划模型（无需 tool_search），且插件会自动评价"
+            "大多数互动，通常无需开启此提醒。"
         ),
         json_schema_extra={"label": "鼓励调用工具"},
+    )
+
+
+class EvaluationSection(PluginConfigBase):
+    """自动评价配置 —— 插件内 LLM 对每轮互动进行上下文综合评价。"""
+
+    __ui_label__ = "自动评价"
+    __ui_icon__ = "brain"
+    __ui_order__ = 6
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "是否启用插件内自动评价：用户消息到达后，由插件调用 LLM，"
+            "基于最近对话上下文、角色性格与当前关系等级，综合判断本次互动"
+            "是否值得改变好感度、方向和幅度。判断不依赖 Planner 的工具调用意愿。"
+        ),
+        json_schema_extra={"label": "启用自动评价"},
+    )
+    model_task: str = Field(
+        default="utils",
+        description=(
+            "自动评价使用的模型任务名，对应 model_config.toml 中的 "
+            "[model_task_config.*]（如 utils / planner）。建议使用轻量快速的小模型。"
+        ),
+        json_schema_extra={"label": "评价模型任务", "placeholder": "utils"},
+    )
+    max_context_messages: int = Field(
+        default=8,
+        description="评价时提供给 LLM 的最近对话条数（含用户与角色双方的消息）。",
+        json_schema_extra={
+            "label": "上下文消息条数",
+            "min": 2,
+            "max": 30,
+            "step": 1,
+        },
+    )
+    max_response_tokens: int = Field(
+        default=1024,
+        description="自动评价请求的最大输出 token 数。",
+        json_schema_extra={
+            "label": "最大输出 Token",
+            "min": 128,
+            "max": 4096,
+            "step": 64,
+        },
+    )
+    temperature: float = Field(
+        default=0.2,
+        description="自动评价请求的温度。较低的值让评价结果更稳定。",
+        json_schema_extra={
+            "label": "评价温度",
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+        },
     )
 
 
@@ -104,6 +161,17 @@ class PersonalitySection(PluginConfigBase):
             "min": 0.1,
             "max": 5.0,
             "step": 0.1,
+        },
+    )
+    character_personality_hint: str = Field(
+        default="",
+        description=(
+            "角色性格简述，供自动评价参考（例如：傲娇、贪财、口嫌体正直的巫女；"
+            "温柔体贴、重视承诺）。留空时自动评价将只能依据性格类型名判断。"
+        ),
+        json_schema_extra={
+            "label": "角色性格简述",
+            "placeholder": "例：傲娇、贪财、口嫌体正直的巫女",
         },
     )
     affection_decay_enabled: bool = Field(
@@ -198,6 +266,53 @@ class AffectionRuleSection(PluginConfigBase):
             "min": 1,
             "max": 100,
             "step": 1,
+        },
+    )
+    high_affection_negative_damper_threshold: float = Field(
+        default=40.0,
+        description=(
+            "高位好感度阻尼阈值：当好感度高于此值时，负面互动造成的扣分"
+            "会按「高位阻尼系数」缩小（亲密关系经得起小摩擦，不会因为一次"
+            "口角大幅掉好感）。"
+        ),
+        json_schema_extra={
+            "label": "高位阻尼阈值",
+            "min": 0,
+            "max": 100,
+            "step": 1,
+        },
+    )
+    high_affection_negative_damper_multiplier: float = Field(
+        default=0.5,
+        description="高位阻尼系数：好感度高于阈值时，单次扣分乘以该系数（0.5 表示扣分减半）。",
+        json_schema_extra={
+            "label": "高位阻尼系数",
+            "min": 0.1,
+            "max": 1.0,
+            "step": 0.05,
+        },
+    )
+    negative_spiral_limit: int = Field(
+        default=3,
+        description=(
+            "负面螺旋阻尼：同一位用户同一天内连续负面调整达到此次数后，"
+            "后续每次扣分再乘以「负面螺旋阻尼系数」，防止短时间内好感度断崖式下跌。"
+        ),
+        json_schema_extra={
+            "label": "负面螺旋次数上限",
+            "min": 1,
+            "max": 20,
+            "step": 1,
+        },
+    )
+    negative_spiral_decay: float = Field(
+        default=0.5,
+        description="负面螺旋阻尼系数：超过上限后，每次扣分乘以该系数（0.5 表示扣分减半）。",
+        json_schema_extra={
+            "label": "负面螺旋阻尼系数",
+            "min": 0.1,
+            "max": 1.0,
+            "step": 0.05,
         },
     )
 
@@ -306,6 +421,7 @@ class AffectionConfig(PluginConfigBase):
     response: ResponseSection = Field(default_factory=ResponseSection)
     user_management: UserManagementSection = Field(default_factory=UserManagementSection)
     call_behavior: CallBehaviorSection = Field(default_factory=CallBehaviorSection)
+    evaluation: EvaluationSection = Field(default_factory=EvaluationSection)
 
 
 def create_config() -> AffectionConfig:

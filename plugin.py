@@ -137,6 +137,10 @@ class AffectionPlugin(MaiBotPlugin):
         # 在 chat.receive.after_process 时建立（消息到达即记录，不依赖入库时机），
         # 供 before_request 按 prompt 中的 msg_id 精确反查当前发言人。
         self._session_message_index: dict[str, deque[tuple[str, str]]] = {}
+        # 自动评价后台任务：{ session_id: asyncio.Task }
+        # 由 chat.receive.after_process 调度，任务内调用 LLM 对互动做上下文评价，
+        # 不阻塞消息接收链路；on_unload 时统一取消。
+        self._evaluation_tasks: dict[str, asyncio.Task] = {}
 
     # ════════════════════════════════════════════════════════════════
     # 生命周期方法
@@ -165,7 +169,10 @@ class AffectionPlugin(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
-        """插件卸载时确保数据写入磁盘，并将运行时数据同步回配置。"""
+        """插件卸载时取消后台任务、写入磁盘，并将运行时数据同步回配置。"""
+        for session_id, task in list(self._evaluation_tasks.items()):
+            task.cancel()
+            self._evaluation_tasks.pop(session_id, None)
         await self._sync_runtime_to_config()
         await self._save_data()
         self.ctx.logger.info("好感度系统插件已卸载，数据已保存")
@@ -689,8 +696,9 @@ class AffectionPlugin(MaiBotPlugin):
         last_date = record.get("last_modified_date", "")
         daily_count = record.get("daily_count", 0)
         if last_date != today:
-            # 新的一天，重置计数
+            # 新的一天，重置计数（含负面螺旋计数）
             record["daily_count"] = 0
+            record["daily_negative_count"] = 0
             record["last_modified_date"] = today
             return False
         limit = self.config.affection_rule.daily_limit
@@ -712,6 +720,48 @@ class AffectionPlugin(MaiBotPlugin):
         # 再乘上用户配置的倍率
         cfg_multiplier = self.config.personality.affection_gain_multiplier
         return change_value * multiplier * cfg_multiplier
+
+    def _apply_relationship_damping(
+        self,
+        change_value: float,
+        record: dict[str, Any],
+        interaction_type: str,
+    ) -> float:
+        """根据当前关系状态对好感度变化施加阻尼。
+
+        两种阻尼（均只作用于负面扣分）：
+            1. 高位阻尼：好感度较高（关系亲密）时，单次扣分按系数缩小，
+               亲密关系经得起小摩擦；
+            2. 负面螺旋阻尼：同一天连续负面调整超过上限后，后续扣分按系数
+               逐次递减，防止短时间内好感度断崖式下跌。
+
+        Args:
+            change_value: 应用性格倍率后的变化值
+            record: 用户好感度记录
+            interaction_type: 互动类型（negative 才应用阻尼）
+
+        Returns:
+            应用关系阻尼后的变化值
+        """
+        if self.config is None:
+            return change_value
+        if change_value >= 0 or interaction_type != "negative":
+            return change_value
+
+        adjusted = change_value
+        cfg = self.config.affection_rule
+        affection = float(record.get("affection", 0.0) or 0.0)
+
+        # 1. 高位阻尼
+        if affection >= cfg.high_affection_negative_damper_threshold:
+            adjusted *= cfg.high_affection_negative_damper_multiplier
+
+        # 2. 负面螺旋阻尼（daily_negative_count 已在调用前自增，含本次）
+        negative_count = int(record.get("daily_negative_count", 0) or 0)
+        if negative_count > cfg.negative_spiral_limit:
+            adjusted *= cfg.negative_spiral_decay ** (negative_count - cfg.negative_spiral_limit)
+
+        return adjusted
 
     async def _update_affection(
         self,
@@ -759,6 +809,11 @@ class AffectionPlugin(MaiBotPlugin):
 
         # 应用性格倍率
         adjusted_change = self._apply_personality_multiplier(change_value)
+
+        # 负面互动先累计当天负面计数（供负面螺旋阻尼使用），再应用关系阻尼
+        if interaction_type == "negative":
+            record["daily_negative_count"] = record.get("daily_negative_count", 0) + 1
+        adjusted_change = self._apply_relationship_damping(adjusted_change, record, interaction_type)
 
         # 计算新的好感度值
         old_affection = record["affection"]
@@ -923,12 +978,13 @@ class AffectionPlugin(MaiBotPlugin):
         "query_affection",
         description=(
             "查询指定用户与角色的当前好感度。返回好感度数值、等级名称、等级描述、"
-            "在该等级内的进度百分比、以及根据当前等级提供给角色的回应风格提示。"
+            "在该等级内的进度百分比、最近几次变化记录、以及根据当前等级提供给角色的回应风格提示。"
             "在角色回复用户之前应调用此工具，以确定合适的语气和态度。"
             "当用户询问「你对我感觉怎样」「我们关系如何」等涉及关系评价的问题时也应调用。"
             "注意：通常无需填写 user_id，运行时会自动注入当前互动对象的 QQ 号；"
             "如需查询指定对象请填写其 QQ 号（不要填昵称）。"
         ),
+        visibility="visible",
         parameters=[
             ToolParameterInfo(
                 name="user_id",
@@ -1031,25 +1087,25 @@ class AffectionPlugin(MaiBotPlugin):
     @Tool(
         "adjust_affection",
         description=(
-            "根据用户与角色的互动情况，调整该用户的好感度值。"
-            "在每一次有意义的互动后（赞美、鼓励、安慰、道歉、感谢、帮助、送礼、表白等"
-            "正面互动；冒犯、嘲讽、争吵、无视、爽约、泼冷水等负面互动），应当调用此工具"
-            "记录并更新好感度。好感度范围从 -20（极度反感）到 100（思慕倾心），初始为 10。"
-            "调用时机与互动类型："
-            "- positive（正面互动）：赞美、鼓励、感谢、安慰、道歉求和、帮助、主动关心、"
-            "分享秘密、陪伴等 → 好感度增加"
-            "- negative（负面互动）：辱骂、嘲讽、争吵、无视、泼冷水、爽约、揭短、"
-            "背叛信任、造谣等 → 好感度减少"
-            "- neutral（中性互动）：普通日常闲聊、问好、讨论话题等 → 好感度基本不变或微量增加"
-            "- special（特殊互动）：送礼、表白、重大帮助、难忘惊喜、特别纪念日等 → 好感度大幅增加"
-            "调整幅度：可填写 change_value 参数，按互动的重要程度给出具体变化值"
-            "（如：轻微调侃 -1、诚心道歉 +2、救命之恩 +8）；不填写时插件会按互动类型"
-            "在配置范围内自动取值。变化值会受角色性格倍率和系统安全范围限制，"
-            "请勿填写极端数值。"
-            "注意：好感度并非每次说话都应调整，琐碎的闲聊不需要调用此工具，避免频繁变更。"
+            "根据一次有实质意义的互动，调整该用户的好感度。"
+            "好感度范围从 -20（极度反感）到 100（思慕倾心），初始为 10。"
+            "判断依据（不要机械套用行为词表，应结合对话上下文与当前关系综合判断）：\n"
+            "1. 用户的真实意图（善意 / 恶意 / 中性）；\n"
+            "2. 互动是否推进关系：主动关心、记得角色说过的小事、顺着角色的话题、"
+            "对角色情绪做出恰当回应、产生默契、主动陪伴、配合角色性格的玩笑等；\n"
+            "3. 是否尊重角色边界：恶意贬低、背叛信任、无视边界、持续骚扰、恶意争吵。\n"
+            "关系解读：同一言行在不同关系下意义不同。在「亲近」「亲密」「思慕」等级下，"
+            "用户的玩笑、打趣、暧昧乃至略带露骨的调侃是关系亲密的体现，应视为正面或中性，"
+            "只有越界、贬低或骚扰才是负面；在较低等级下，同样的言行才更容易构成冒犯。\n"
+            "日常琐碎闲聊、单句问候、无实质内容的互动不需要调整好感度。\n"
+            "重大事件（如表白、送礼、重大帮助、背叛信任）可填写 change_value 给出精确变化值"
+            "（如轻微调侃 -1、诚心道歉 +2、救命之恩 +8）；不填写时插件按互动类型在配置范围内自动取值，"
+            "并受角色性格倍率与关系阻尼限制，请勿填写极端数值。\n"
+            "注意：插件会自动评价大多数日常互动，本工具主要用于重大事件或自动评价遗漏的情形。\n"
             "注意：通常无需填写 user_id，运行时会自动注入当前互动对象的 QQ 号；"
             "如需调整指定对象请填写其 QQ 号（不要填昵称）。"
         ),
+        visibility="visible",
         parameters=[
             ToolParameterInfo(
                 name="user_id",
@@ -1320,6 +1376,9 @@ class AffectionPlugin(MaiBotPlugin):
                 del dq[index]
                 break
         dq.append((message_id, user_id))
+
+        # 调度自动评价（后台任务，不阻塞消息接收链路）
+        self._schedule_auto_evaluation(session_id, user_id, message)
         return {"action": "continue"}
 
     @staticmethod
@@ -1743,8 +1802,346 @@ class AffectionPlugin(MaiBotPlugin):
         if session_id and user_id:
             self._session_user_map[session_id] = user_id
 
+    # ════════════════════════════════════════════════════════════════
+    # 自动评价：基于上下文与关系的互动综合评价
+    # ════════════════════════════════════════════════════════════════
+    # 设计说明：
+    #   - 由 chat.receive.after_process 在用户消息到达时调度为后台任务，
+    #     不阻塞消息接收与后续 Planner/Reply 流程。
+    #   - 评价不依赖 Planner 的工具调用意愿：插件直接调用 Host 的 LLM，
+    #     输入最近对话上下文、角色性格与当前关系等级，输出是否需要变化、
+    #     方向、幅度与理由，再走统一的 _update_affection 落库。
+    #   - 任何异常都静默降级（记录 debug 日志），绝不影响聊天主流程。
+
+    def _schedule_auto_evaluation(
+        self,
+        session_id: str,
+        user_id: str,
+        message: dict[str, Any] | None,
+    ) -> None:
+        """调度一次自动评价后台任务（带会话级去重）。
+
+        Args:
+            session_id: 会话 ID
+            user_id: 消息发送者用户标识
+            message: 触发消息字典（用于前置过滤）
+        """
+        if self.config is None:
+            return
+        try:
+            if not self.config.plugin.enabled:
+                return
+            if not self.config.evaluation.enabled:
+                return
+        except AttributeError:
+            return
+        session_id = str(session_id or "").strip()
+        user_id = str(user_id or "").strip()
+        if not (session_id and user_id):
+            return
+
+        # 命令 / 通知消息不评价
+        if isinstance(message, dict):
+            if message.get("is_command") or message.get("is_notify"):
+                return
+
+        # 同一会话已有活跃评价任务则跳过，避免连续消息排队堆积
+        existing = self._evaluation_tasks.get(session_id)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._auto_evaluate(session_id, user_id))
+        self._evaluation_tasks[session_id] = task
+
+    async def _auto_evaluate(self, session_id: str, user_id: str) -> None:
+        """执行一次自动评价：取上下文 → LLM 综合评价 → 按需调整好感度。
+
+        整个方法在任何环节失败时静默降级，不抛出异常影响主流程。
+
+        Args:
+            session_id: 会话 ID
+            user_id: 待评价的用户标识（QQ 号）
+        """
+        try:
+            if self.config is None:
+                return
+            # 冷却期内不评价（也省一次 LLM 调用）
+            if self._check_cool_down(user_id):
+                return
+            # 当日次数已满不评价
+            if self._check_daily_limit(user_id):
+                return
+            # 被锁定用户不评价
+            record = self._affection_data.get(user_id)
+            if record is not None and record.get("locked", False):
+                return
+
+            # 1. 取最近对话上下文（含角色回复，用于判断互动氛围）
+            context_messages = await self._fetch_recent_context_messages(
+                session_id, self.config.evaluation.max_context_messages
+            )
+            if not context_messages:
+                return
+
+            # 2. 构造评价请求并调用 LLM
+            prompt = self._build_evaluation_prompt(user_id, context_messages)
+            result = await self.ctx.llm.generate(
+                prompt,
+                model=str(self.config.evaluation.model_task or "").strip(),
+                temperature=self.config.evaluation.temperature,
+                max_tokens=self.config.evaluation.max_response_tokens,
+            )
+            if not isinstance(result, dict) or not result.get("success"):
+                self.ctx.logger.debug(
+                    "自动评价调用失败 (session=%s, user=%s): %s",
+                    session_id, user_id, result.get("error") if isinstance(result, dict) else result,
+                )
+                return
+            response_text = str(result.get("response") or "").strip()
+            if not response_text:
+                return
+
+            # 3. 解析评价结果
+            evaluation = self._parse_evaluation_result(response_text)
+            if not evaluation:
+                self.ctx.logger.debug(
+                    "自动评价输出解析失败 (session=%s, user=%s): %.200s",
+                    session_id, user_id, response_text,
+                )
+                return
+            if not evaluation["need_change"] or evaluation["direction"] == "neutral":
+                return
+
+            # 4. 幅度映射并落库
+            direction = evaluation["direction"]
+            change_value = self._magnitude_to_change_value(direction, evaluation["magnitude"])
+            description = evaluation["reason"] or "自动评价"
+            result = await self._update_affection(
+                user_id=user_id,
+                change_value=change_value,
+                interaction_type=direction,
+                description=f"[自动评价] {description}",
+            )
+            if result.get("success"):
+                self.ctx.logger.info(
+                    "自动评价生效: user=%s, %s %.1f → %.1f, 理由=%s",
+                    user_id,
+                    direction,
+                    result.get("old_affection"),
+                    result.get("new_affection"),
+                    description,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.ctx.logger.debug("自动评价异常 (session=%s, user=%s): %s", session_id, user_id, e)
+        finally:
+            # 仅当当前任务仍是注册中的任务时才清理，避免误删并发注册的新任务
+            current = asyncio.current_task()
+            if self._evaluation_tasks.get(session_id) is current:
+                self._evaluation_tasks.pop(session_id, None)
+
+    async def _fetch_recent_context_messages(
+        self,
+        session_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """获取会话最近消息用于评价上下文。
+
+        Args:
+            session_id: 会话 ID
+            limit: 最多取多少条
+
+        Returns:
+            序列化消息字典列表（时间正序，不含命令/通知/无文本消息）
+        """
+        try:
+            raw = await self.ctx.call_capability(
+                "message.get_recent",
+                chat_id=session_id,
+                hours=24.0,
+                limit=max(2, limit),
+                limit_mode="latest",
+                filter_mai=False,
+            )
+        except Exception as e:
+            self.ctx.logger.debug("获取评价上下文失败 (%s): %s", session_id, e)
+            return []
+        if isinstance(raw, dict):
+            raw = raw.get("messages") or []
+        if not isinstance(raw, list):
+            return []
+
+        cleaned: list[dict[str, Any]] = []
+        for msg in raw:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("is_command") or msg.get("is_notify"):
+                continue
+            content = str(msg.get("processed_plain_text") or msg.get("content") or "").strip()
+            if not content:
+                continue
+            cleaned.append(msg)
+        return cleaned
+
+    def _build_evaluation_prompt(
+        self,
+        user_id: str,
+        context_messages: list[dict[str, Any]],
+    ) -> str:
+        """构造自动评价提示词。
+
+        Args:
+            user_id: 待评价的用户标识
+            context_messages: 最近的序列化消息列表
+
+        Returns:
+            评价提示词文本
+        """
+        record = self._get_user_record(user_id)
+        affection_value = record.get("affection", 0.0)
+        level_info = _get_affection_level_info(affection_value)
+        char_name = self.config.personality.character_name
+        personality_hint = str(self.config.personality.character_personality_hint or "").strip()
+        if not personality_hint:
+            personality_hint = self.config.personality.personality_type
+
+        lines = [
+            f"你是一位「{char_name}」的角色好感度评估助手，"
+            f"负责判断用户刚才的互动是否应改变{char_name}对该用户的好感度。",
+            f"角色性格概述：{personality_hint}",
+            f"当前好感度：{level_info['value']} 点，等级「{level_info['level_name']}」"
+            f"（{level_info['level_description']}）。",
+            "",
+            "判断规则：",
+            "1. 同一言行在不同关系下的意义不同：在「亲近」「亲密」「思慕」等较高等级下，"
+            "用户的关心、玩笑、打趣、暧昧、撒娇等是关系亲密的体现，应视为正向或中性；"
+            "在较低等级下，轻浮或冒犯性的言行才更容易构成负面。",
+            "2. 正向迹象：主动关心、记得角色说过的小事、顺着角色的话题、对角色情绪做出"
+            "恰当回应、产生默契、主动陪伴、配合角色的玩笑等。",
+            "3. 负面迹象：恶意贬低角色人格、背叛信任、无视边界、持续骚扰、恶意争吵。"
+            "日常玩笑打闹与口是心非的傲娇互动不属于负面。",
+            "4. 琐碎闲聊、单句问候、无实质内容的互动应判定为无需变化。",
+            "",
+            "最近对话：",
+        ]
+        for msg in context_messages:
+            sender = self._extract_sender_label(msg)
+            content = str(msg.get("processed_plain_text") or msg.get("content") or "").strip()
+            lines.append(f"[{sender}] {content}")
+
+        lines.append("")
+        lines.append("请只输出一个 JSON 对象，不要输出任何其他内容：")
+        lines.append(
+            '{"need_change": true或false, "direction": "positive"/"neutral"/"negative", '
+            '"magnitude": 1-3, "reason": "一句话中文理由"}'
+        )
+        lines.append(
+            "其中 magnitude：1=轻微，2=普通，3=明显；日常互动最高给 2，"
+            "重大事件（如表白、送礼、重大帮助）通常由角色主动处理，自动评价一般给 1~2。"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_sender_label(msg: dict[str, Any]) -> str:
+        """从序列化消息中提取发送者展示名。
+
+        Args:
+            msg: 序列化消息字典
+
+        Returns:
+            发送者昵称/群名片；无法识别时返回「未知用户」
+        """
+        message_info = msg.get("message_info")
+        if not isinstance(message_info, dict):
+            return "未知用户"
+        user_info = message_info.get("user_info")
+        if not isinstance(user_info, dict):
+            return "未知用户"
+        label = str(
+            user_info.get("user_cardname") or user_info.get("user_nickname") or ""
+        ).strip()
+        return label or "未知用户"
+
+    @staticmethod
+    def _parse_evaluation_result(raw_text: str) -> dict[str, Any] | None:
+        """从模型输出中容错解析评价 JSON。
+
+        兼容模型输出带 markdown 代码块或前后解释性文字的情况。
+
+        Args:
+            raw_text: 模型原始输出
+
+        Returns:
+            规范化后的评价结果；解析失败返回 None
+        """
+        text = raw_text.strip()
+        # 去掉 markdown 代码块围栏
+        if text.startswith("```"):
+            lines = text.splitlines()
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        need_change = bool(data.get("need_change", False))
+        direction = str(data.get("direction", "neutral") or "").strip().lower()
+        if direction not in {"positive", "negative", "neutral"}:
+            direction = "neutral"
+        try:
+            magnitude = int(float(data.get("magnitude", 1)))
+        except (TypeError, ValueError):
+            magnitude = 1
+        magnitude = max(1, min(5, magnitude))
+        reason = str(data.get("reason", "") or "").strip()[:200]
+        return {
+            "need_change": need_change,
+            "direction": direction,
+            "magnitude": magnitude,
+            "reason": reason,
+        }
+
+    def _magnitude_to_change_value(self, direction: str, magnitude: int) -> float:
+        """把评价幅度映射为配置范围内的好感度变化值。
+
+        magnitude 1~5 线性映射到配置区间：
+            positive: [positive_interaction_min, positive_interaction_max]
+            negative: [negative_interaction_max, negative_interaction_min]
+
+        Args:
+            direction: 互动方向（positive / negative）
+            magnitude: 评价幅度 1~5
+
+        Returns:
+            配置范围内的变化值（含符号）
+        """
+        cfg = self.config.affection_rule
+        ratio = (max(1, min(5, magnitude)) - 1) / 4.0
+        if direction == "positive":
+            return cfg.positive_interaction_min + (
+                cfg.positive_interaction_max - cfg.positive_interaction_min
+            ) * ratio
+        if direction == "negative":
+            return cfg.negative_interaction_max - (
+                cfg.negative_interaction_max - cfg.negative_interaction_min
+            ) * ratio
+        return 0.0
+
     def _build_affection_hint(self, user_id: str, *, for_replyer: bool = False) -> str:
         """构造写入消息窗口的好感度提示文本。
+
+        提示只包含当前等级与回应态度，不枚举行为清单——互动是否值得改变好感度
+        由插件内自动评价与 Planner 按上下文综合判断，不在此处灌输规则。
 
         Args:
             user_id: 权威用户标识（QQ 号）
@@ -1757,7 +2154,7 @@ class AffectionPlugin(MaiBotPlugin):
         """
         record = self._affection_data.get(user_id)
         if record is None:
-            # 尚无记录，给出中性提示即可（仍鼓励 LLM 感知并调用工具）
+            # 尚无记录，给出中性提示即可
             record = self._get_user_record(user_id)
         affection_value = record.get("affection", 0.0)
         level_info = _get_affection_level_info(affection_value)
@@ -1767,7 +2164,7 @@ class AffectionPlugin(MaiBotPlugin):
         lines = [
             f"【好感度提示】你对当前这位用户的好感度为 {level_info['value']} 点，"
             f"属于「{level_info['level_name']}」等级：{level_info['level_description']}。",
-            f"与这位{char_name}的互动应体现的态度：{response_hint}",
+            f"回应时应体现：{response_hint}",
         ]
         if record.get("locked", False):
             lines.append("（该用户好感度已被管理员锁定，请保持当前态度，不要试图改变。）")
@@ -1777,9 +2174,8 @@ class AffectionPlugin(MaiBotPlugin):
             and self.config.call_behavior.encourage_tool_calls
         ):
             lines.append(
-                "如果本次互动有明显的正面或负面情绪（如赞美、安慰、道歉、感谢、帮助、"
-                "送礼、表白、嘲讽、争吵、无视等），在回应之后请调用 adjust_affection "
-                "工具更新好感度。"
+                "如果本次互动与当前关系明显相关（值得加深或需要警惕），"
+                "在回应之后可调用 adjust_affection 工具调整好感度。"
             )
         return "\n".join(lines)
 
@@ -1787,7 +2183,7 @@ class AffectionPlugin(MaiBotPlugin):
         """构造不绑定具体用户的好感度提示文本。
 
         当无法从会话解析出发言者 QQ 号时使用（例如首次群聊、缓存未建立时），
-        仍然提醒 LLM 感知好感度系统并鼓励调用 adjust_affection 工具。
+        仅提醒 LLM 感知好感度系统并保持角色一致的亲近程度。
 
         Args:
             for_replyer: 是否用于 replyer 参考信息。为 True 时不包含工具调用引导，
@@ -1803,9 +2199,8 @@ class AffectionPlugin(MaiBotPlugin):
         ]
         if not for_replyer and self.config and self.config.call_behavior.encourage_tool_calls:
             lines.append(
-                "如果本次互动有明显的正面或负面情绪（如赞美、安慰、道歉、感谢、帮助、"
-                "送礼、表白、嘲讽、争吵、无视等），在回应之后请调用 adjust_affection "
-                "工具更新好感度。"
+                "如果本次互动与当前关系明显相关（值得加深或需要警惕），"
+                "在回应之后可调用 adjust_affection 工具调整好感度。"
             )
         return "\n".join(lines)
 
