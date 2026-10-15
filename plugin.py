@@ -1219,19 +1219,40 @@ class AffectionPlugin(MaiBotPlugin):
                 return indexed_user
         return ""
 
-    def _planner_speakers(self, items: list[dict[str, Any]], session_id: str) -> dict[str, str]:
-        speakers = {}
+    async def _resolve_message_speaker(self, session_id: str, message_id: str) -> str:
+        user_id = self._lookup_message_speaker(session_id, message_id)
+        if user_id:
+            return user_id
+        message = await self.ctx.message.get_by_id(message_id, chat_id=session_id)
+        if message is None:
+            return ""
+        if message.get("success") is False:
+            raise RuntimeError(message["error"])
+        user_id = self._resolve_user_id(str(message["message_info"]["user_info"]["user_id"]))
+        if not user_id:
+            raise ValueError("回复目标消息缺少有效的发送者 QQ 号")
+        self._session_message_index.setdefault(session_id, deque(maxlen=100)).append((message_id, user_id))
+        return user_id
+
+    async def _planner_speakers(self, items: list[dict[str, Any]], session_id: str) -> dict[str, str]:
+        message_ids = {}
         for item in items:
             if item["item_type"] != "UserMessageItem":
                 continue
-            for part in item["parts"]:
+            for part in item["parts"][:1]:
                 if part["type"] != "text" or not part["text"].startswith("<message "):
                     continue
                 message_id = self._extract_prompt_message_id(part["text"].splitlines()[0])
-                user_id = self._lookup_message_speaker(session_id, message_id)
-                if user_id:
-                    speakers[message_id] = user_id
-        return speakers
+                if message_id:
+                    message_ids[message_id] = None
+        semaphore = asyncio.Semaphore(4)
+
+        async def resolve(message_id: str) -> str:
+            async with semaphore:
+                return await self._resolve_message_speaker(session_id, message_id)
+
+        users = await asyncio.gather(*(resolve(mid) for mid in message_ids))
+        return {mid: user_id for mid, user_id in zip(message_ids, users) if user_id}
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -1245,7 +1266,7 @@ class AffectionPlugin(MaiBotPlugin):
                 or random.random() >= self.config.call_behavior.inject_probability):
             return None
         users = {}
-        for message_id, user_id in self._planner_speakers(kwargs["items"], kwargs["session_id"]).items():
+        for message_id, user_id in (await self._planner_speakers(kwargs["items"], kwargs["session_id"])).items():
             users.setdefault(user_id, []).append(message_id)
         records = [
             f"QQ={user_id}，msg_id={','.join(message_ids)}：\n{self._build_affection_hint(user_id)}"
@@ -1282,17 +1303,11 @@ class AffectionPlugin(MaiBotPlugin):
         message_id = kwargs["reply_message_id"]
         if not message_id:
             return None
-        user_id = self._lookup_message_speaker(session_id, message_id)
+        user_id = await self._resolve_message_speaker(session_id, message_id)
         if not user_id:
-            message = await self.ctx.message.get_by_id(message_id, chat_id=session_id)
-            if message is None:
-                return None
-            if message.get("success") is False:
-                raise RuntimeError(message["error"])
-            user_id = self._resolve_user_id(str(message["message_info"]["user_info"]["user_id"]))
-            if not user_id:
-                raise ValueError("回复目标消息缺少有效的发送者 QQ 号")
-        hint = self._build_affection_hint(user_id, for_replyer=True)
+            return None
+        hint = f"【回复目标好感度】QQ={user_id}，msg_id={message_id}\n"
+        hint += self._build_affection_hint(user_id, for_replyer=True)
         hint += "\n以上仅表示对该账号的态度，不改变身份认证插件给出的固定关系。"
         kwargs["extra_prompt"] = "\n\n".join(filter(None, [kwargs["extra_prompt"], hint]))
         return {"action": "continue", "modified_kwargs": kwargs}
