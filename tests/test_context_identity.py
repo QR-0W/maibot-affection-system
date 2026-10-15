@@ -10,6 +10,10 @@ import logging
 import sys
 import types
 
+from maibot_sdk.context import PluginContext
+
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "feyumy_context_testpkg"
@@ -28,11 +32,18 @@ def plugin():
     instance.config.evaluation.enabled = False
     instance._ctx = SimpleNamespace(
         logger=logging.getLogger("affection-test"),
-        message=SimpleNamespace(get_by_id=AsyncMock(return_value={"success": True, "message": None})),
+        message=SimpleNamespace(get_by_id=AsyncMock(return_value=None)),
         llm=SimpleNamespace(generate=AsyncMock()),
         call_capability=AsyncMock(return_value={"success": True, "messages": []}),
     )
     return instance
+
+
+def sdk_plugin(response):
+    instance = plugin()
+    rpc = AsyncMock(return_value=response)
+    instance._set_context(PluginContext("feyumy.affection-system", rpc_call=rpc))
+    return instance, rpc
 
 
 def message(mid="a", uid="123456", session="group-a", text="测试"):
@@ -108,20 +119,25 @@ def test_replyer_uses_target_not_latest_speaker():
 
 
 def test_replyer_after_reload_uses_exact_message_lookup():
-    p = plugin()
-    p.ctx.message.get_by_id.return_value = {"success": True, "message": message()}
+    p, rpc = sdk_plugin({"success": True, "message": message()})
     result = asyncio.run(p.inject_affection_into_reply(
-        session_id="group-a", reply_message_id="a", extra_prompt="",
+        session_id="group-a", reply_message_id="a", extra_prompt="original", reply_args={"x": 1},
     ))
     assert result is not None
-    p.ctx.message.get_by_id.assert_awaited_once_with("a", chat_id="group-a")
+    assert result["modified_kwargs"]["extra_prompt"].startswith("original\n\n")
+    assert "【好感度提示】" in result["modified_kwargs"]["extra_prompt"]
+    assert result["modified_kwargs"]["reply_args"] == {"x": 1}
+    rpc.assert_awaited_once_with("cap.call", "feyumy.affection-system", {
+        "capability": "message.get_by_id",
+        "args": {"message_id": "a", "chat_id": "group-a", "stream_id": "", "include_binary_data": False},
+    })
     assert list(p._affection_data) == ["123456"]
 
 
 def test_empty_reply_target_skips_lookup_and_record_creation():
     p = plugin()
     asyncio.run(p.index_message_speaker(message=message("b", "654321")))
-    p.ctx.message.get_by_id.return_value = {"success": True, "message": message("b", "654321")}
+    p.ctx.message.get_by_id.return_value = message("b", "654321")
     result = asyncio.run(p.inject_affection_into_reply(
         session_id="group-a", reply_message_id="", extra_prompt="original",
     ))
@@ -220,3 +236,100 @@ def test_zero_injection_probability_disables_both_hooks():
     assert asyncio.run(p.inject_affection_before_request(items=planner_items(), session_id="group-a")) is None
     assert asyncio.run(p.inject_affection_into_reply(session_id="group-a", reply_message_id="a", extra_prompt="")) is None
     p.ctx.message.get_by_id.assert_not_awaited()
+
+
+def test_sdk_missing_message_skips_without_using_another_speaker():
+    p, rpc = sdk_plugin({"success": True, "message": None})
+    asyncio.run(p.index_message_speaker(message=message("b", "654321")))
+    kwargs = {"session_id": "group-a", "reply_message_id": "missing", "extra_prompt": "original"}
+    assert asyncio.run(p.inject_affection_into_reply(**kwargs)) is None
+    assert kwargs["extra_prompt"] == "original"
+    assert not p._affection_data
+    rpc.assert_awaited_once()
+
+
+def test_sdk_rpc_failure_propagates_to_hook_diagnostics():
+    p, rpc = sdk_plugin(None)
+    rpc.side_effect = RuntimeError("message lookup failed")
+    with pytest.raises(RuntimeError, match="message lookup failed"):
+        asyncio.run(p.inject_affection_into_reply(
+            session_id="group-a", reply_message_id="a", extra_prompt="original",
+        ))
+    assert not p._affection_data
+    assert p.inject_affection_into_reply.__maibot_component_info__.error_policy is module.ErrorPolicy.SKIP
+
+
+def test_sdk_host_failure_preserves_error_for_hook_diagnostics():
+    p, rpc = sdk_plugin({"success": False, "error": "message access denied"})
+    with pytest.raises(RuntimeError, match="message access denied"):
+        asyncio.run(p.inject_affection_into_reply(
+            session_id="group-a", reply_message_id="a", extra_prompt="original",
+        ))
+    assert not p._affection_data
+    rpc.assert_awaited_once()
+
+
+@pytest.mark.parametrize("user_id", ["", None, "测试用户", "person-sid"])
+def test_sdk_invalid_sender_is_not_used_or_replaced(user_id):
+    p, rpc = sdk_plugin({"success": True, "message": message(uid=user_id)})
+    asyncio.run(p.index_message_speaker(message=message("b", "654321")))
+    with pytest.raises(ValueError, match="缺少有效的发送者 QQ 号"):
+        asyncio.run(p.inject_affection_into_reply(
+            session_id="group-a", reply_message_id="a", extra_prompt="original",
+        ))
+    assert not p._affection_data
+    rpc.assert_awaited_once()
+
+
+@pytest.mark.parametrize("raw_message", [{}, {"message_info": {}}, {"message_info": {"user_info": {}}}])
+def test_sdk_malformed_message_propagates_to_hook_diagnostics(raw_message):
+    p, rpc = sdk_plugin({"success": True, "message": raw_message})
+    with pytest.raises(KeyError):
+        asyncio.run(p.inject_affection_into_reply(
+            session_id="group-a", reply_message_id="a", extra_prompt="original",
+        ))
+    assert not p._affection_data
+    rpc.assert_awaited_once()
+
+
+def test_query_metadata_preserves_schema_and_uses_on_demand_guidance():
+    p = plugin()
+    component = p.query_affection.__maibot_component_info__
+    assert component.name == "query_affection"
+    assert component.metadata["visibility"] == "visible"
+    assert len(component.parameters) == 1
+    parameter = component.parameters[0]
+    assert parameter.name == "user_id"
+    assert parameter.required
+    assert parameter.param_type is module.ToolParamType.STRING
+    assert parameter.description == "目标用户 QQ 号，取自本轮消息关系索引，不接受昵称或人物 SID。"
+    assert "当前上下文缺少完成任务所需的好感度信息时使用" in component.description
+    assert "已有对应用户的信息且足够使用时，无需重复查询" in component.description
+    assert "在角色回复用户之前应调用" not in component.description
+    assert "也应调用" not in component.description
+
+
+def test_query_result_still_contains_status_and_recent_changes_without_scoring():
+    p = plugin()
+    record = p._get_user_record("123456")
+    record["affection"] = 35.0
+    record["locked"] = True
+    record["note"] = "test note"
+    record["history"] = [
+        {"change": 1.0, "type": "positive", "description": f"event-{index}", "time": f"time-{index}"}
+        for index in range(7)
+    ]
+    original = copy.deepcopy(record)
+    result = asyncio.run(p.query_affection(user_id="123456"))
+    assert set(result) == {
+        "success", "user_id", "affection_value", "affection_level", "level_description",
+        "level_progress_percent", "level_range", "response_hint", "character_name", "locked",
+        "note", "recent_changes", "suggestion",
+    }
+    assert result["success"]
+    assert result["user_id"] == "123456"
+    assert result["affection_value"] == 35.0
+    assert result["locked"]
+    assert result["note"] == "test note"
+    assert result["recent_changes"] == original["history"][-5:]
+    assert record == original

@@ -804,8 +804,8 @@ class AffectionPlugin(MaiBotPlugin):
         description=(
             "查询指定用户与角色的当前好感度。返回好感度数值、等级名称、等级描述、"
             "在该等级内的进度百分比、最近几次变化记录、以及根据当前等级提供给角色的回应风格提示。"
-            "在角色回复用户之前应调用此工具，以确定合适的语气和态度。"
-            "当用户询问「你对我感觉怎样」「我们关系如何」等涉及关系评价的问题时也应调用。"
+            "当前上下文缺少完成任务所需的好感度信息时使用；"
+            "已有对应用户的信息且足够使用时，无需重复查询。"
             "注意：必须填写关系索引中对应消息的用户 QQ 号；"
             "如需查询指定对象请填写其 QQ 号（不要填昵称）。"
         ),
@@ -1284,13 +1284,14 @@ class AffectionPlugin(MaiBotPlugin):
             return None
         user_id = self._lookup_message_speaker(session_id, message_id)
         if not user_id:
-            result = await self.ctx.message.get_by_id(message_id, chat_id=session_id)
-            if not result["success"]:
-                raise RuntimeError(result["error"])
-            message = result["message"]
+            message = await self.ctx.message.get_by_id(message_id, chat_id=session_id)
             if message is None:
                 return None
-            user_id = str(message["message_info"]["user_info"]["user_id"])
+            if message.get("success") is False:
+                raise RuntimeError(message["error"])
+            user_id = self._resolve_user_id(str(message["message_info"]["user_info"]["user_id"]))
+            if not user_id:
+                raise ValueError("回复目标消息缺少有效的发送者 QQ 号")
         hint = self._build_affection_hint(user_id, for_replyer=True)
         hint += "\n以上仅表示对该账号的态度，不改变身份认证插件给出的固定关系。"
         kwargs["extra_prompt"] = "\n\n".join(filter(None, [kwargs["extra_prompt"], hint]))
