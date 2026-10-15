@@ -36,6 +36,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import tomlkit
 
@@ -129,15 +130,11 @@ class AffectionPlugin(MaiBotPlugin):
         self._file_lock: asyncio.Lock = asyncio.Lock()
         # 同步配置表时的去重记录：避免重复写入 config.toml
         self._last_config_sync_key: str = ""
-        # 会话 → 最近发言用户映射缓存：{ session_id: user_id }
-        # 群聊流的 user_id 为 None，无法从 stream 直接反查；该缓存由
-        # before_request 每轮解析成功时刷新，代表「当前轮发言人」。
-        self._session_user_map: dict[str, str] = {}
         # 接收索引：{ session_id: deque[(message_id, user_id)] }
         # 在 chat.receive.after_process 时建立（消息到达即记录，不依赖入库时机），
         # 供 before_request 按 prompt 中的 msg_id 精确反查当前发言人。
         self._session_message_index: dict[str, deque[tuple[str, str]]] = {}
-        # 自动评价后台任务：{ session_id: asyncio.Task }
+        # 自动评价后台任务：{ user_id: asyncio.Task }
         # 由 chat.receive.after_process 调度，任务内调用 LLM 对互动做上下文评价，
         # 不阻塞消息接收链路；on_unload 时统一取消。
         self._evaluation_tasks: dict[str, asyncio.Task] = {}
@@ -156,8 +153,6 @@ class AffectionPlugin(MaiBotPlugin):
         await self._migrate_legacy_data_dir()
         # 加载已有数据
         await self._load_data()
-        # 迁移历史昵称记录到 QQ 号（避免同一人被拆成两条记录）
-        await self._migrate_nickname_records()
         # 执行衰减检查
         await self._apply_decay_check()
         # 将运行时数据同步到 config.toml，让 WebUI 管理表展示最新好感度
@@ -170,9 +165,9 @@ class AffectionPlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         """插件卸载时取消后台任务、写入磁盘，并将运行时数据同步回配置。"""
-        for session_id, task in list(self._evaluation_tasks.items()):
+        for user_id, task in list(self._evaluation_tasks.items()):
             task.cancel()
-            self._evaluation_tasks.pop(session_id, None)
+            self._evaluation_tasks.pop(user_id, None)
         await self._sync_runtime_to_config()
         await self._save_data()
         self.ctx.logger.info("好感度系统插件已卸载，数据已保存")
@@ -256,79 +251,6 @@ class AffectionPlugin(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.error("加载好感度数据失败: %s", e)
             self._affection_data = {}
-
-    async def _migrate_nickname_records(self) -> None:
-        """把历史遗留的昵称记录迁移/合并到对应的 QQ 号记录。
-
-        早期版本在群聊中可能用昵称作为 user_id 存储，私聊中用 QQ 号存储，
-        导致同一个人被拆成两条记录。这里在加载后尝试把昵称记录解析为 QQ 号，
-        若 QQ 号记录已存在则合并，否则将昵称键替换为 QQ 号键。
-
-        昵称无法解析时保留原记录，避免数据丢失。
-        """
-        # 找出非纯数字的 user_id（视为昵称记录）
-        nickname_keys = [
-            uid for uid in self._affection_data
-            if str(uid or "").strip() and not str(uid).strip().isdigit()
-        ]
-        if not nickname_keys:
-            return
-
-        migrated = 0
-        for nick in nickname_keys:
-            try:
-                person_id = await self.ctx.person.get_id_by_name(nick)
-            except Exception as e:
-                self.ctx.logger.debug("迁移昵称记录失败 (%s): %s", nick, e)
-                continue
-            if not person_id:
-                continue
-            person_id_str = str(person_id).strip()
-            if not person_id_str:
-                continue
-            if person_id_str == nick:
-                continue
-
-            nick_record = self._affection_data.pop(nick)
-            if person_id_str in self._affection_data:
-                # 已存在 QQ 号记录：合并（取好感度较高者，历史合并）
-                existing = self._affection_data[person_id_str]
-                old_affection = existing.get("affection", 0.0)
-                nick_affection = nick_record.get("affection", 0.0)
-                # 历史记录合并
-                merged_history = list(existing.get("history", [])) + list(
-                    nick_record.get("history", [])
-                )
-                if len(merged_history) > 200:
-                    merged_history = merged_history[-200:]
-                existing["history"] = merged_history
-                # 记录一次迁移事件
-                existing["history"].append({
-                    "time": datetime.now().isoformat(),
-                    "change": 0.0,
-                    "actual_change": 0.0,
-                    "type": "migration",
-                    "description": f"合并昵称记录「{nick}」到 QQ 号 {person_id_str}",
-                    "old_value": round(old_affection, 1),
-                    "new_value": round(old_affection, 1),
-                })
-                # 取两者中较高好感度，避免历史拆分后丢失
-                existing["affection"] = max(old_affection, nick_affection)
-                self.ctx.logger.info(
-                    "合并昵称记录: %s -> %s (好感度取较高值 %.1f)",
-                    nick, person_id_str, existing["affection"],
-                )
-            else:
-                # 直接替换键为 QQ 号
-                self._affection_data[person_id_str] = nick_record
-                self.ctx.logger.info(
-                    "迁移昵称记录: %s -> %s", nick, person_id_str
-                )
-            migrated += 1
-
-        if migrated > 0:
-            await self._save_data()
-            self.ctx.logger.info("昵称记录迁移完成: 共 %d 条", migrated)
 
     async def _save_data(self) -> None:
         """将好感度数据写入磁盘（带锁保护）。"""
@@ -562,107 +484,10 @@ class AffectionPlugin(MaiBotPlugin):
             }
         return self._affection_data[user_id]
 
-    async def _resolve_user_id(
-        self,
-        requested_user_id: str,
-        stream_id: str = "",
-        **kwargs: Any,
-    ) -> str:
-        """将互动对象统一解析为稳定、唯一的 QQ 号标识。
-
-        背景：群聊中 LLM 可能通过昵称识别互动对象，私聊中可能通过 QQ 号识别，
-        导致同一个人被当成两个人分别记录。这里统一识别口径。
-
-        解析优先级：
-            1. 运行时注入的 user_id（消息元数据中的真实平台 ID，即 QQ 号）
-            2. 显式传入且为纯数字的 user_id（视为 QQ 号）
-            3. 尝试通过 person 能力把昵称解析为人物 ID
-            4. 当前轮发言人（before_request 已按 prompt 锚定刷新）→ 接收索引
-               最近发言人 → 消息库最近消息（群聊关键：Tool 调用上下文在群聊
-               中不携带 user_id）
-            5. 兜底：原样返回
-
-        Args:
-            requested_user_id: LLM 传入的 user_id 参数（可能是昵称或 QQ 号）
-            stream_id: 当前聊天流 ID（由调用方传入，用于群聊反查）
-            **kwargs: 运行时注入的上下文参数（含权威 user_id 等）
-
-        Returns:
-            归一化后的稳定用户标识（优先为 QQ 号）
-        """
-        # 1. 运行时注入的 user_id 是消息元数据中的真实平台 ID，优先采用。
-        #    注意：当 Tool 方法签名含 user_id 参数时，注入值会绑定到命名参数
-        #    而非 kwargs，因此此处同时兼容两种传递方式。
-        injected = str(kwargs.get("user_id", "") or "").strip()
-        if injected and injected.isdigit():
-            self.ctx.logger.debug("使用运行时注入的用户标识: %s", injected)
-            return injected
-
-        # 2. 显式传入的纯数字参数直接视为 QQ 号（可能是注入绑定值或 LLM 填的）
-        requested = str(requested_user_id or "").strip()
-        if requested.isdigit():
-            return requested
-
-        # 3. 尝试把昵称解析为人物 ID（人物 ID 通常为纯数字，即平台 user_id）
-        if requested:
-            try:
-                person_id = await self.ctx.person.get_id_by_name(requested)
-                if person_id:
-                    person_id_str = str(person_id).strip()
-                    if person_id_str.isdigit():
-                        self.ctx.logger.debug(
-                            "已通过昵称解析用户标识: %s -> %s", requested, person_id_str
-                        )
-                        return person_id_str
-                    # 人物 ID 非纯数字时仍可安全使用（唯一且稳定）
-                    return person_id_str
-            except Exception as e:
-                self.ctx.logger.debug("昵称解析失败 (%s): %s", requested, e)
-
-        # 4. 群聊兜底：使用当前会话已解析的发言人。
-        #    群聊会话按群维度建立（session_id 只含群号），Tool 调用上下文里的
-        #    chat_stream.user_id 恒为空。优先使用 before_request 每轮解析并
-        #    刷新的「当前轮发言人」缓存，其次为接收索引中的最近发言人，
-        #    最后退回消息库最近消息反查。
-        resolved_stream_id = str(stream_id or "").strip() or str(
-            kwargs.get("stream_id") or kwargs.get("chat_id") or ""
-        ).strip()
-        if resolved_stream_id:
-            # 4.1 当前轮发言人缓存（before_request 已按 prompt 锚定刷新）
-            cached_user = self._session_user_map.get(resolved_stream_id, "")
-            if cached_user:
-                self.ctx.logger.debug(
-                    "使用当前轮发言人缓存: %s -> %s", resolved_stream_id, cached_user
-                )
-                return cached_user
-
-            # 4.2 接收索引最近发言人（近似）
-            indexed_user = self._lookup_latest_session_speaker(resolved_stream_id)
-            if indexed_user:
-                self.ctx.logger.debug(
-                    "使用接收索引最近发言人: %s -> %s", resolved_stream_id, indexed_user
-                )
-                return indexed_user
-
-            # 4.3 消息库最近消息反查（兜底）
-            try:
-                session_user = await self._resolve_user_id_from_recent_messages(
-                    resolved_stream_id
-                )
-                if session_user:
-                    self.ctx.logger.debug(
-                        "已通过会话最近消息解析用户标识: %s -> %s",
-                        resolved_stream_id,
-                        session_user,
-                    )
-                    return session_user
-            except Exception as e:
-                self.ctx.logger.debug(
-                    "会话最近消息解析失败 (%s): %s", resolved_stream_id, e
-                )
-
-        # 5. 兜底：返回注入值或原参数
-        return injected or requested
+    def _resolve_user_id(self, requested_user_id: str) -> str:
+        """好感记录统一使用 QQ 号，不把昵称或人物 SID 当成账号。"""
+        user_id = requested_user_id.strip()
+        return user_id if user_id.isdigit() else ""
 
     def _check_cool_down(self, user_id: str) -> bool:
         """检查用户是否处于好感度变更冷却期。
@@ -981,7 +806,7 @@ class AffectionPlugin(MaiBotPlugin):
             "在该等级内的进度百分比、最近几次变化记录、以及根据当前等级提供给角色的回应风格提示。"
             "在角色回复用户之前应调用此工具，以确定合适的语气和态度。"
             "当用户询问「你对我感觉怎样」「我们关系如何」等涉及关系评价的问题时也应调用。"
-            "注意：通常无需填写 user_id，运行时会自动注入当前互动对象的 QQ 号；"
+            "注意：必须填写关系索引中对应消息的用户 QQ 号；"
             "如需查询指定对象请填写其 QQ 号（不要填昵称）。"
         ),
         visibility="visible",
@@ -989,40 +814,29 @@ class AffectionPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="user_id",
                 param_type=ToolParamType.STRING,
-                description="要查询好感度的用户 QQ 号。通常可留空，运行时会自动注入当前互动对象的 QQ 号。",
-                required=False,
-            ),
-            ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID，由运行时自动注入，无需手动填写",
-                required=False,
+                description="目标用户 QQ 号，取自本轮消息关系索引，不接受昵称或人物 SID。",
+                required=True,
             ),
         ],
     )
     async def query_affection(
         self,
         user_id: str = "",
-        stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
         """查询指定用户的好感度。
 
         Args:
-            user_id: 用户 QQ 号或昵称（可留空，运行时注入当前对象；会统一解析为 QQ 号）
-            stream_id: 聊天流 ID（由运行时注入）
-            **kwargs: 额外参数
+            user_id: 取自本轮消息关系索引的 QQ 号，不接受昵称或人物 SID
+            **kwargs: Host 注入的上下文，不用于推测用户
 
         Returns:
             好感度查询结果
         """
-        # 统一识别：优先使用运行时注入的真实 QQ 号，避免群聊昵称/私聊 QQ 号歧义
-        resolved_user_id = await self._resolve_user_id(user_id, stream_id, **kwargs)
+        # 仅校验显式 QQ 号，不从 Host 上下文推测目标。
+        resolved_user_id = self._resolve_user_id(user_id)
         if not resolved_user_id:
             return {"success": False, "error": "无法确定互动对象的用户标识"}
-
-        # 记录「会话 ↔ 用户」映射，供注入 Hook 反查使用
-        self._record_session_user(stream_id, resolved_user_id)
 
         # 获取好感度数据
         record = self._get_user_record(resolved_user_id)
@@ -1102,7 +916,7 @@ class AffectionPlugin(MaiBotPlugin):
             "（如轻微调侃 -1、诚心道歉 +2、救命之恩 +8）；不填写时插件按互动类型在配置范围内自动取值，"
             "并受角色性格倍率与关系阻尼限制，请勿填写极端数值。\n"
             "注意：插件会自动评价大多数日常互动，本工具主要用于重大事件或自动评价遗漏的情形。\n"
-            "注意：通常无需填写 user_id，运行时会自动注入当前互动对象的 QQ 号；"
+            "注意：必须填写关系索引中对应消息的用户 QQ 号；"
             "如需调整指定对象请填写其 QQ 号（不要填昵称）。"
         ),
         visibility="visible",
@@ -1110,8 +924,8 @@ class AffectionPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="user_id",
                 param_type=ToolParamType.STRING,
-                description="要调整好感度的用户 QQ 号。通常可留空，运行时会自动注入当前互动对象的 QQ 号。",
-                required=False,
+                description="目标用户 QQ 号，取自本轮消息关系索引，不接受昵称或人物 SID。",
+                required=True,
             ),
             ToolParameterInfo(
                 name="interaction_type",
@@ -1137,12 +951,6 @@ class AffectionPlugin(MaiBotPlugin):
                 ),
                 required=False,
             ),
-            ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID，由运行时自动注入，无需手动填写",
-                required=False,
-            ),
         ],
     )
     async def adjust_affection(
@@ -1151,29 +959,24 @@ class AffectionPlugin(MaiBotPlugin):
         interaction_type: str = "",
         description: str = "",
         change_value: float | None = None,
-        stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
         """根据互动调整用户好感度。
 
         Args:
-            user_id: 用户 QQ 号或昵称（可留空，运行时注入当前对象；会统一解析为 QQ 号）
+            user_id: 取自本轮消息关系索引的 QQ 号，不接受昵称或人物 SID
             interaction_type: 互动类型
             description: 互动描述
             change_value: 可选的精确变化值（可正可负）；不填时按互动类型自动取值
-            stream_id: 聊天流 ID（由运行时注入）
-            **kwargs: 额外参数
+            **kwargs: Host 注入的上下文，不用于推测用户
 
         Returns:
             调整结果
         """
-        # 统一识别：优先使用运行时注入的真实 QQ 号，避免群聊昵称/私聊 QQ 号歧义
-        resolved_user_id = await self._resolve_user_id(user_id, stream_id, **kwargs)
+        # 仅校验显式 QQ 号，不从 Host 上下文推测目标。
+        resolved_user_id = self._resolve_user_id(user_id)
         if not resolved_user_id:
             return {"success": False, "error": "无法确定互动对象的用户标识"}
-
-        # 记录「会话 ↔ 用户」映射，供注入 Hook 反查使用
-        self._record_session_user(stream_id, resolved_user_id)
 
         # 参数校验
         valid_types = {"positive", "neutral", "negative", "special"}
@@ -1416,391 +1219,82 @@ class AffectionPlugin(MaiBotPlugin):
                 return indexed_user
         return ""
 
-    def _lookup_latest_session_speaker(self, session_id: str) -> str:
-        """返回会话接收索引中最近一条消息的发送者（近似方案）。
-
-        当无法从 prompt 精确锚定（例如 replyer 阶段无消息列表）时，
-        使用「最近发言者」作为近似。
-
-        Args:
-            session_id: 会话 ID
-
-        Returns:
-            最近发言者用户标识；索引为空时返回空字符串
-        """
-        dq = self._session_message_index.get(session_id)
-        if not dq:
-            return ""
-        return dq[-1][1]
-
-    def _resolve_user_from_prompt_messages(
-        self,
-        session_id: str,
-        messages: list[dict[str, Any]],
-    ) -> str:
-        """从 planner prompt 的最后一条用户消息精确锚定发言人。
-
-        prompt 是按接收顺序构建的快照，晚于本轮构建到达的消息不会进入
-        prompt；因此「最后一条用户消息」就是模型本轮实际看到并要回应的
-        消息。解析其 msg_id 后在接收索引中反查发送者，即可规避
-        「他人消息先入库」导致的错配。
-
-        Args:
-            session_id: 会话 ID
-            messages: before_request 收到的序列化消息列表
-
-        Returns:
-            锚定到的用户标识；无法锚定时返回空字符串
-        """
-        for msg in reversed(messages):
-            if not isinstance(msg, dict):
+    def _planner_speakers(self, items: list[dict[str, Any]], session_id: str) -> dict[str, str]:
+        speakers = {}
+        for item in items:
+            if item["item_type"] != "UserMessageItem":
                 continue
-            if msg.get("role") != "user":
-                continue
-            # 工具结果也会以 user 角色出现（带 tool_call_id），跳过
-            if msg.get("tool_call_id"):
-                continue
-            content = str(msg.get("content") or "")
-            message_id = self._extract_prompt_message_id(content)
-            if not message_id:
-                # 非真实会话消息（如参考消息、引导回复），继续向前找
-                continue
-            user_id = self._lookup_message_speaker(session_id, message_id)
-            if user_id:
-                return user_id
-            # 最后一条真实用户消息的 msg_id 在索引中未命中（如插件热重载后
-            # 索引尚未重建），不再向前匹配更早的消息，交由后续兜底逻辑处理，
-            # 避免错配到历史发言人。
-            return ""
-        return ""
-
-    # ════════════════════════════════════════════════════════════════
-    # Hook: 注入好感度提示（参考 ns_auto-planning_schedule 的调用方式）
-    # ════════════════════════════════════════════════════════════════
-    # 目的：提高 LLM 对好感度的感知，从而：
-    #   1. 按照对应好感度等级自然回应；
-    #   2. 更倾向于在互动后调用 adjust_affection 工具更新好感度。
-    #
-    # 参考 AutoPlanning 插件经过验证的机制：
-    #   - 主通道：maisaka.planner.after_response（BLOCKING），在 planner 决定调用
-    #     reply 后，把好感度上下文注入 reply 工具的 reference_info 参数。replyer
-    #     生成回复时会读取 reference_info，因此 LLM 一定能感知到好感度。
-    #   - 辅助通道：maisaka.planner.before_request（BLOCKING），在 LLM 规划前
-    #     向消息窗口插入一条系统提示，进一步促使 LLM 调用 adjust_affection。
-    # 两条通道每次请求都会注入（不再走概率采样）。
-
-    @HookHandler(
-        "maisaka.planner.after_response",
-        name="affection_inject_into_reply",
-        description="在 planner 决定调用 reply 后，将当前用户好感度上下文注入 reply 的 reference_info，使 LLM 回复体现好感度并倾向调用 adjust_affection",
-        mode=HookMode.BLOCKING,
-        order=HookOrder.LATE,
-        timeout_ms=3000,
-        error_policy=ErrorPolicy.SKIP,
-    )
-    async def inject_affection_into_reply(
-        self,
-        tool_calls: list[dict[str, Any]] | None = None,
-        session_id: str = "",
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """参考 AutoPlanning 插件：在 planner 决定调用 reply 后注入好感度参考。
-
-        找到 reply 工具调用，把好感度上下文注入其 reference_info 参数，
-        使 replyer 生成回复时参考好感度等级。
-
-        Args:
-            tool_calls: planner 生成的工具调用列表
-            session_id: 当前会话 ID
-            **kwargs: 其他 Hook 参数
-
-        Returns:
-            Hook 分发结果：{"action": "continue", "modified_kwargs": {...}}
-        """
-        del kwargs
-        if self.config is None:
-            return {"action": "continue"}
-        if not self.config.plugin.enabled:
-            return {"action": "continue"}
-        if not self.config.call_behavior.inject_affection_hint:
-            return {"action": "continue"}
-        if not isinstance(tool_calls, list) or not tool_calls:
-            return {"action": "continue"}
-
-        # 通过 session_id 反查发言者 QQ 号；解析失败时退化为通用好感度提示，
-        # 确保注入始终发生（参考 AutoPlanning 插件每次请求都注入）。
-        #
-        # 注意：本 Hook 注入的是 replyer 参考信息。replyer 模型没有工具也没有
-        # 工具 Schema，若提示里出现「请调用 adjust_affection 工具」之类的指令，
-        # 模型会以 <function_calls> 文本形式模仿工具调用并原样发出，造成工具
-        # 调用信息泄漏到聊天。因此这里只注入好感度态度提示，绝不包含工具调用引导。
-        user_id = await self._resolve_user_id_from_session(session_id)
-        if user_id:
-            hint_text = self._build_affection_hint(user_id, for_replyer=True)
-        else:
-            hint_text = self._build_generic_affection_hint(for_replyer=True)
-            self.ctx.logger.info(
-                "未解析到会话 %s 的用户标识，注入通用好感度提示", session_id
-            )
-        if not hint_text:
-            return {"action": "continue"}
-
-        modified_tool_calls = self._inject_into_reply_reference(tool_calls, hint_text)
-        if modified_tool_calls is tool_calls:
-            return {"action": "continue"}
-
-        result = {"action": "continue", "modified_kwargs": {"tool_calls": modified_tool_calls}}
-        self.ctx.logger.info(
-            "已向会话 %s 的 reply 注入好感度参考 (%s)", session_id, user_id
-        )
-        return result
-
-    @staticmethod
-    def _inject_into_reply_reference(
-        tool_calls: list[dict[str, Any]],
-        hint_text: str,
-    ) -> list[dict[str, Any]]:
-        """把好感度提示注入 reply 工具的 reference_info 参数。
-
-        参考 AutoPlanning 插件的 inject_schedule_into_reply 实现。
-
-        Args:
-            tool_calls: planner 生成的工具调用列表
-            hint_text: 好感度提示文本
-
-        Returns:
-            修改后的工具调用列表；未找到 reply 时返回原列表
-        """
-        reply_idx = None
-        for i, tc in enumerate(tool_calls):
-            func = tc.get("function", {}) if isinstance(tc, dict) else {}
-            if isinstance(func, dict) and func.get("name") == "reply":
-                reply_idx = i
-                break
-        if reply_idx is None:
-            return tool_calls
-
-        modified = [dict(tc) for tc in tool_calls]
-        tc = modified[reply_idx]
-        func = dict(tc.get("function", {}))
-        args = dict(func.get("arguments", {}))
-        existing_ref = str(args.get("reference_info", "") or "").strip()
-        if existing_ref:
-            args["reference_info"] = f"{existing_ref}\n\n{hint_text}"
-        else:
-            args["reference_info"] = hint_text
-        func["arguments"] = args
-        tc["function"] = func
-        modified[reply_idx] = tc
-        return modified
+            for part in item["parts"]:
+                if part["type"] != "text" or not part["text"].startswith("<message "):
+                    continue
+                message_id = self._extract_prompt_message_id(part["text"].splitlines()[0])
+                user_id = self._lookup_message_speaker(session_id, message_id)
+                if user_id:
+                    speakers[message_id] = user_id
+        return speakers
 
     @HookHandler(
         "maisaka.planner.before_request",
-        name="affection_planner_injector",
-        description="在 LLM 规划请求前，将当前用户的好感度提示注入消息窗口，提高 LLM 感知与 adjust_affection 工具调用频率",
+        name="affection_inject_before_request",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
-        timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def inject_affection_before_request(
-        self,
-        messages: list[dict[str, Any]] | None = None,
-        session_id: str = "",
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """在 LLM 请求前注入好感度提示。
-
-        每次都注入（不受概率控制）。通过 session_id 反查发言者 QQ 号，
-        构造好感度系统提示并插入 messages 列表首部，确保 LLM 一定感知到。
-
-        Args:
-            messages: 即将发给模型的 PromptMessage 列表
-            session_id: 当前会话 ID
-            **kwargs: 其他 Hook 参数
-
-        Returns:
-            Hook 分发结果：{"action": "continue", "modified_kwargs": {...}}
-        """
-        del kwargs
-        if self.config is None:
-            return {"action": "continue"}
-        if not self.config.plugin.enabled:
-            return {"action": "continue"}
-        if not self.config.call_behavior.inject_affection_hint:
-            return {"action": "continue"}
-        if not isinstance(messages, list) or not messages:
-            return {"action": "continue"}
-
-        # 通过 session_id 反查发言者 QQ 号；优先用 prompt 中的 msg_id 精确锚定，
-        # 解析失败时退化为通用好感度提示，确保注入始终发生。
-        user_id = await self._resolve_user_id_from_session(session_id, messages)
-        if user_id:
-            hint_text = self._build_affection_hint(user_id)
-        else:
-            hint_text = self._build_generic_affection_hint()
-            self.ctx.logger.info(
-                "未解析到会话 %s 的用户标识，注入通用好感度提示", session_id
-            )
-        if not hint_text:
-            return {"action": "continue"}
-
-        # 注入一条 system 提示。若消息中已有 system 消息，则插在最后一个
-        # system 之后；否则直接作为首条。这样既不影响原有系统提示，又能
-        # 保证 LLM 一定看到好感度提示。
-        hint_msg = {"role": "system", "content": hint_text}
-        last_system_idx = -1
-        for idx, msg in enumerate(messages):
-            if isinstance(msg, dict) and msg.get("role") == "system":
-                last_system_idx = idx
-        if last_system_idx < 0:
-            modified_messages = [hint_msg] + list(messages)
-        else:
-            modified_messages = (
-                list(messages[: last_system_idx + 1])
-                + [hint_msg]
-                + list(messages[last_system_idx + 1 :])
-            )
-
-        self.ctx.logger.info(
-            "已向会话 %s 注入好感度提示 (%d 条消息 -> %d 条, user=%s)",
-            session_id,
-            len(messages),
-            len(modified_messages),
-            user_id,
+    async def inject_affection_before_request(self, **kwargs: Any) -> dict[str, Any] | None:
+        if (not self.config.plugin.enabled or not self.config.call_behavior.inject_affection_hint
+                or random.random() >= self.config.call_behavior.inject_probability):
+            return None
+        users = {}
+        for message_id, user_id in self._planner_speakers(kwargs["items"], kwargs["session_id"]).items():
+            users.setdefault(user_id, []).append(message_id)
+        records = [
+            f"QQ={user_id}，msg_id={','.join(message_ids)}：\n{self._build_affection_hint(user_id)}"
+            for user_id, message_ids in users.items()
+        ]
+        if not records:
+            return None
+        prompt = (
+            "【按消息号匹配的好感度】身份认证决定固定身份，好感度只影响态度，不创建或取消主人身份。\n"
+            + "\n".join(records)
         )
-        return {"action": "continue", "modified_kwargs": {"messages": modified_messages}}
+        item = {
+            "item_type": "UserMessageItem",
+            "meta": {"item_id": uuid4().hex, "logical_turn_id": None, "timestamp": datetime.now().isoformat()},
+            "parts": [{"type": "text", "text": prompt}],
+        }
+        items = kwargs["items"]
+        insert_at = len(items) - (bool(items) and items[-1]["item_type"] == "AssistantMessageItem")
+        items.insert(insert_at, item)
+        return {"action": "continue", "modified_kwargs": kwargs}
 
-    async def _resolve_user_id_from_session(
-        self,
-        session_id: str,
-        messages: list[dict[str, Any]] | None = None,
-    ) -> str:
-        """根据会话 ID 反查发言者的权威用户标识（QQ 号）。
-
-        解析优先级：
-            1. prompt 锚定：从 messages 中最后一条用户消息的 msg_id 精确反查
-               （接收索引在 chat.receive.after_process 时建立，与入库时机无关）
-            2. 接收索引中该会话最近一条消息的发送者（无 prompt 时的近似）
-            3. 运行时 Tool 调用时缓存的「会话↔用户」映射
-            4. 从消息库最近消息反查（兜底）
-            5. 从聊天流列表反查（仅对私聊有效，群聊流 user_id 恒为空）
-
-        Args:
-            session_id: 会话 ID
-            messages: 可选；planner before_request 收到的序列化消息列表，
-                用于 msg_id 精确锚定
-
-        Returns:
-            用户平台 ID；无法解析时返回空字符串
-        """
-        session_id = str(session_id or "").strip()
-        if not session_id:
-            return ""
-
-        # 1. prompt 锚定（最精确）：prompt 是接收顺序的快照，晚于本轮构建
-        #    到达的消息不会进入 prompt；最后一条用户消息的 msg_id 即本轮
-        #    要回应的消息，反查接收索引即可拿到其发送者。
-        if isinstance(messages, list) and messages:
-            anchored_user_id = self._resolve_user_from_prompt_messages(session_id, messages)
-            if anchored_user_id:
-                self._session_user_map[session_id] = anchored_user_id
-                return anchored_user_id
-
-        # 2. 接收索引最近发言人（近似，replyer 等无 prompt 场景）
-        latest_user_id = self._lookup_latest_session_speaker(session_id)
-        if latest_user_id:
-            self._session_user_map[session_id] = latest_user_id
-            return latest_user_id
-
-        # 3. 命中缓存（由 Tool 调用或之前轮次解析记录）
-        cached = self._session_user_map.get(session_id, "")
-        if cached:
-            return cached
-
-        # 4. 从消息库最近消息反查（兜底：插件热重载后索引尚未建立时）
-        recent_user_id = await self._resolve_user_id_from_recent_messages(session_id)
-        if recent_user_id:
-            self._session_user_map[session_id] = recent_user_id
-            return recent_user_id
-
-        # 5. 从聊天流列表反查（私聊场景有效）
-        try:
-            streams = await self.ctx.chat.get_all_streams(platform="all_platforms")
-        except Exception as e:
-            self.ctx.logger.debug("获取聊天流列表失败 (%s): %s", session_id, e)
-            return ""
-        if not isinstance(streams, list):
-            return ""
-        for stream in streams:
-            if not isinstance(stream, dict):
-                continue
-            sid = str(stream.get("session_id") or stream.get("stream_id") or "").strip()
-            if sid == session_id:
-                uid = str(stream.get("user_id") or "").strip()
-                if uid:
-                    self._session_user_map[session_id] = uid
-                return uid
-        return ""
-
-    async def _resolve_user_id_from_recent_messages(self, session_id: str) -> str:
-        """从会话最近消息反查当前发言人用户标识（QQ 号）。
-
-        群聊中会话按群维度建立（session_id 仅由平台+群号计算），发言人的
-        用户标识只能从具体消息的 message_info.user_info 获取。触发本次请求的
-        用户消息在进入 chat loop 前已写入消息库（见 heartflow_message_processor
-        的 store_message_to_db），因此「最近一条用户消息」的发送者就是当前
-        互动对象；私聊场景同样成立。
-
-        Args:
-            session_id: 会话 ID
-
-        Returns:
-            最近发言人平台 ID；无法解析时返回空字符串
-        """
-        session_id = str(session_id or "").strip()
-        if not session_id:
-            return ""
-        try:
-            raw = await self.ctx.call_capability(
-                "message.get_recent",
-                chat_id=session_id,
-                limit=8,
-                filter_mai=True,
-            )
-        except Exception as e:
-            self.ctx.logger.debug("查询会话 %s 最近消息失败: %s", session_id, e)
-            return ""
-        if isinstance(raw, dict):
-            raw = raw.get("messages") or []
-        if not isinstance(raw, list) or not raw:
-            return ""
-        # 消息按时间正序返回，倒序遍历取最近一条带发送者的用户消息
-        for msg in reversed(raw):
-            if not isinstance(msg, dict):
-                continue
-            message_info = msg.get("message_info")
-            if not isinstance(message_info, dict):
-                continue
-            user_info = message_info.get("user_info")
-            if not isinstance(user_info, dict):
-                continue
-            uid = str(user_info.get("user_id") or "").strip()
-            if uid:
-                return uid
-        return ""
-
-    def _record_session_user(self, session_id: str, user_id: str) -> None:
-        """记录「会话 ID → 权威 QQ 号」映射，供注入 Hook 使用。
-
-        Args:
-            session_id: 会话 ID
-            user_id: 权威用户标识（QQ 号）
-        """
-        session_id = str(session_id or "").strip()
-        user_id = str(user_id or "").strip()
-        if session_id and user_id:
-            self._session_user_map[session_id] = user_id
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        name="affection_inject_into_reply",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_affection_into_reply(self, **kwargs: Any) -> dict[str, Any] | None:
+        if (not self.config.plugin.enabled or not self.config.call_behavior.inject_affection_hint
+                or random.random() >= self.config.call_behavior.inject_probability):
+            return None
+        session_id = kwargs["session_id"]
+        message_id = kwargs["reply_message_id"]
+        if not message_id:
+            return None
+        user_id = self._lookup_message_speaker(session_id, message_id)
+        if not user_id:
+            result = await self.ctx.message.get_by_id(message_id, chat_id=session_id)
+            if not result["success"]:
+                raise RuntimeError(result["error"])
+            message = result["message"]
+            if message is None:
+                return None
+            user_id = str(message["message_info"]["user_info"]["user_id"])
+        hint = self._build_affection_hint(user_id, for_replyer=True)
+        hint += "\n以上仅表示对该账号的态度，不改变身份认证插件给出的固定关系。"
+        kwargs["extra_prompt"] = "\n\n".join(filter(None, [kwargs["extra_prompt"], hint]))
+        return {"action": "continue", "modified_kwargs": kwargs}
 
     # ════════════════════════════════════════════════════════════════
     # 自动评价：基于上下文与关系的互动综合评价
@@ -1811,7 +1305,7 @@ class AffectionPlugin(MaiBotPlugin):
     #   - 评价不依赖 Planner 的工具调用意愿：插件直接调用 Host 的 LLM，
     #     输入最近对话上下文、角色性格与当前关系等级，输出是否需要变化、
     #     方向、幅度与理由，再走统一的 _update_affection 落库。
-    #   - 任何异常都静默降级（记录 debug 日志），绝不影响聊天主流程。
+    #   - 后台评价失败时记录异常，不阻断聊天主流程。
 
     def _schedule_auto_evaluation(
         self,
@@ -1819,7 +1313,7 @@ class AffectionPlugin(MaiBotPlugin):
         user_id: str,
         message: dict[str, Any] | None,
     ) -> None:
-        """调度一次自动评价后台任务（带会话级去重）。
+        """调度一次自动评价后台任务（带用户级去重）。
 
         Args:
             session_id: 会话 ID
@@ -1828,12 +1322,7 @@ class AffectionPlugin(MaiBotPlugin):
         """
         if self.config is None:
             return
-        try:
-            if not self.config.plugin.enabled:
-                return
-            if not self.config.evaluation.enabled:
-                return
-        except AttributeError:
+        if not self.config.plugin.enabled or not self.config.evaluation.enabled:
             return
         session_id = str(session_id or "").strip()
         user_id = str(user_id or "").strip()
@@ -1845,18 +1334,18 @@ class AffectionPlugin(MaiBotPlugin):
             if message.get("is_command") or message.get("is_notify"):
                 return
 
-        # 同一会话已有活跃评价任务则跳过，避免连续消息排队堆积
-        existing = self._evaluation_tasks.get(session_id)
+        # 同一用户已有活跃评价任务则跳过，避免跨群重复计分
+        existing = self._evaluation_tasks.get(user_id)
         if existing is not None and not existing.done():
             return
 
-        task = asyncio.create_task(self._auto_evaluate(session_id, user_id))
-        self._evaluation_tasks[session_id] = task
+        task = asyncio.create_task(self._auto_evaluate(session_id, user_id, message))
+        self._evaluation_tasks[user_id] = task
 
-    async def _auto_evaluate(self, session_id: str, user_id: str) -> None:
+    async def _auto_evaluate(self, session_id: str, user_id: str, message: dict[str, Any]) -> None:
         """执行一次自动评价：取上下文 → LLM 综合评价 → 按需调整好感度。
 
-        整个方法在任何环节失败时静默降级，不抛出异常影响主流程。
+        后台任务失败时记录完整异常，不阻断聊天主流程。
 
         Args:
             session_id: 会话 ID
@@ -1880,14 +1369,14 @@ class AffectionPlugin(MaiBotPlugin):
             context_messages = await self._fetch_recent_context_messages(
                 session_id, self.config.evaluation.max_context_messages
             )
-            if not context_messages:
-                return
+            context_messages = [msg for msg in context_messages if msg["message_id"] != message["message_id"]]
+            context_messages = context_messages[-(self.config.evaluation.max_context_messages - 1):] + [message]
 
             # 2. 构造评价请求并调用 LLM
             prompt = self._build_evaluation_prompt(user_id, context_messages)
             result = await self.ctx.llm.generate(
                 prompt,
-                model=str(self.config.evaluation.model_task or "").strip(),
+                task_name=self.config.evaluation.model_task,
                 temperature=self.config.evaluation.temperature,
                 max_tokens=self.config.evaluation.max_response_tokens,
             )
@@ -1934,12 +1423,12 @@ class AffectionPlugin(MaiBotPlugin):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self.ctx.logger.debug("自动评价异常 (session=%s, user=%s): %s", session_id, user_id, e)
+            self.ctx.logger.warning("自动评价异常 (session=%s, user=%s): %s", session_id, user_id, e, exc_info=True)
         finally:
             # 仅当当前任务仍是注册中的任务时才清理，避免误删并发注册的新任务
             current = asyncio.current_task()
-            if self._evaluation_tasks.get(session_id) is current:
-                self._evaluation_tasks.pop(session_id, None)
+            if self._evaluation_tasks.get(user_id) is current:
+                self._evaluation_tasks.pop(user_id, None)
 
     async def _fetch_recent_context_messages(
         self,
@@ -2009,6 +1498,7 @@ class AffectionPlugin(MaiBotPlugin):
         lines = [
             f"你是一位「{char_name}」的角色好感度评估助手，"
             f"负责判断用户刚才的互动是否应改变{char_name}对该用户的好感度。",
+            f"本次只评价 QQ={user_id} 的最后一条消息；其他成员的言行仅作上下文，不计入此人的好感。",
             f"角色性格概述：{personality_hint}",
             f"当前好感度：{level_info['value']} 点，等级「{level_info['level_name']}」"
             f"（{level_info['level_description']}）。",
@@ -2028,16 +1518,17 @@ class AffectionPlugin(MaiBotPlugin):
         for msg in context_messages:
             sender = self._extract_sender_label(msg)
             content = str(msg.get("processed_plain_text") or msg.get("content") or "").strip()
-            lines.append(f"[{sender}] {content}")
+            speaker_id = msg["message_info"]["user_info"]["user_id"]
+            lines.append(f"[QQ={speaker_id}，{sender}] {content}")
 
         lines.append("")
         lines.append("请只输出一个 JSON 对象，不要输出任何其他内容：")
         lines.append(
             '{"need_change": true或false, "direction": "positive"/"neutral"/"negative", '
-            '"magnitude": 1-3, "reason": "一句话中文理由"}'
+            '"magnitude": 1-5, "reason": "一句话中文理由"}'
         )
         lines.append(
-            "其中 magnitude：1=轻微，2=普通，3=明显；日常互动最高给 2，"
+            "其中 magnitude：1=轻微，3=普通，5=明显；日常互动最高给 3，"
             "重大事件（如表白、送礼、重大帮助）通常由角色主动处理，自动评价一般给 1~2。"
         )
         return "\n".join(lines)
@@ -2179,30 +1670,6 @@ class AffectionPlugin(MaiBotPlugin):
             )
         return "\n".join(lines)
 
-    def _build_generic_affection_hint(self, *, for_replyer: bool = False) -> str:
-        """构造不绑定具体用户的好感度提示文本。
-
-        当无法从会话解析出发言者 QQ 号时使用（例如首次群聊、缓存未建立时），
-        仅提醒 LLM 感知好感度系统并保持角色一致的亲近程度。
-
-        Args:
-            for_replyer: 是否用于 replyer 参考信息。为 True 时不包含工具调用引导，
-                避免 replyer（无工具）以 <function_calls> 文本形式模仿并泄漏。
-
-        Returns:
-            提示文本
-        """
-        char_name = self.config.personality.character_name if self.config else "角色"
-        lines = [
-            f"【好感度提示】你与这位用户的好感度系统已启用，请根据过往互动自然回应，"
-            f"态度与亲近程度保持角色一致（{char_name}的性格）。",
-        ]
-        if not for_replyer and self.config and self.config.call_behavior.encourage_tool_calls:
-            lines.append(
-                "如果本次互动与当前关系明显相关（值得加深或需要警惕），"
-                "在回应之后可调用 adjust_affection 工具调整好感度。"
-            )
-        return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════
