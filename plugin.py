@@ -489,6 +489,12 @@ class AffectionPlugin(MaiBotPlugin):
         user_id = requested_user_id.strip()
         return user_id if user_id.isdigit() else ""
 
+    async def _get_bot_user_id(self) -> str:
+        user_id = self._resolve_user_id(str(await self.ctx.config.get("bot.qq_account")))
+        if not user_id or user_id == "0":
+            raise ValueError("无法获取有效的机器人 QQ 号，跳过好感度提示与自动评价")
+        return user_id
+
     def _check_cool_down(self, user_id: str) -> bool:
         """检查用户是否处于好感度变更冷却期。
 
@@ -1171,6 +1177,8 @@ class AffectionPlugin(MaiBotPlugin):
                 user_id = str(user_info.get("user_id") or "").strip()
         if not (session_id and message_id and user_id):
             return {"action": "continue"}
+        if user_id == await self._get_bot_user_id():
+            return {"action": "continue"}
 
         # 保序去重：同一 message_id 重新接收时移到队尾
         dq = self._session_message_index.setdefault(session_id, deque(maxlen=100))
@@ -1265,9 +1273,11 @@ class AffectionPlugin(MaiBotPlugin):
         if (not self.config.plugin.enabled or not self.config.call_behavior.inject_affection_hint
                 or random.random() >= self.config.call_behavior.inject_probability):
             return None
+        bot_user_id = await self._get_bot_user_id()
         users = {}
         for message_id, user_id in (await self._planner_speakers(kwargs["items"], kwargs["session_id"])).items():
-            users.setdefault(user_id, []).append(message_id)
+            if user_id != bot_user_id:
+                users.setdefault(user_id, []).append(message_id)
         records = [
             f"QQ={user_id}，msg_id={','.join(message_ids)}：\n{self._build_affection_hint(user_id)}"
             for user_id, message_ids in users.items()
@@ -1304,7 +1314,7 @@ class AffectionPlugin(MaiBotPlugin):
         if not message_id:
             return None
         user_id = await self._resolve_message_speaker(session_id, message_id)
-        if not user_id:
+        if not user_id or user_id == await self._get_bot_user_id():
             return None
         hint = f"【回复目标好感度】QQ={user_id}，msg_id={message_id}\n"
         hint += self._build_affection_hint(user_id, for_replyer=True)

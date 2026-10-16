@@ -16,6 +16,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BOT = "999999"
 PACKAGE = "feyumy_context_testpkg"
 package = types.ModuleType(PACKAGE)
 package.__path__ = [str(ROOT)]
@@ -32,6 +33,7 @@ def plugin():
     instance.config.evaluation.enabled = False
     instance._ctx = SimpleNamespace(
         logger=logging.getLogger("affection-test"),
+        config=SimpleNamespace(get=AsyncMock(return_value=BOT)),
         message=SimpleNamespace(get_by_id=AsyncMock(return_value=None)),
         llm=SimpleNamespace(generate=AsyncMock()),
         call_capability=AsyncMock(return_value={"success": True, "messages": []}),
@@ -41,9 +43,16 @@ def plugin():
 
 def sdk_plugin(response):
     instance = plugin()
-    rpc = AsyncMock(return_value=response)
+    message_rpc = AsyncMock(return_value=response)
+
+    async def rpc(method, plugin_id, payload):
+        if payload["capability"] == "config.get":
+            assert payload["args"] == {"key": "bot.qq_account", "default": None}
+            return BOT
+        return await message_rpc(method, plugin_id, payload)
+
     instance._set_context(PluginContext("feyumy.affection-system", rpc_call=rpc))
-    return instance, rpc
+    return instance, message_rpc
 
 
 def message(mid="a", uid="123456", session="group-a", text="测试"):

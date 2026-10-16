@@ -18,6 +18,9 @@ def test_cold_planner_history_exceeds_receive_cache():
         items.append(fixture.item("UserMessageItem", f'<message msg_id="{mid}" user="同名">旧消息', mid))
 
     async def rpc(method, plugin_id, payload):
+        if payload["capability"] == "config.get":
+            assert payload["args"] == {"key": "bot.qq_account", "default": None}
+            return fixture.BOT
         args = payload["args"]
         assert args["chat_id"] == "group-a"
         return {"success": True, "message": messages.get(args["message_id"])}
